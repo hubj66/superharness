@@ -254,6 +254,7 @@ def _apply_action(item: dict, rule: LifecycleRule, age: float, limit: int) -> bo
 
 def _scan_inbox(project_dir: str, rules: list[LifecycleRule], profile: dict) -> int:
     from superharness.engine import state_reader, state_writer
+    from superharness.engine.reliable_watcher import reliable_task_ids
 
     try:
         items = state_reader.get_inbox_items(project_dir)
@@ -261,9 +262,13 @@ def _scan_inbox(project_dir: str, rules: list[LifecycleRule], profile: dict) -> 
         logger.warning("lifecycle_rules.py unexpected error: %s", e, exc_info=True)
         return 0
 
+    reliable_ids = reliable_task_ids(project_dir)
+
     changed = 0
     for item in items:
         if not isinstance(item, dict):
+            continue
+        if str(item.get("task", item.get("task_id", ""))) in reliable_ids:
             continue
         original_status = item.get("status")
         for rule in rules:
@@ -310,6 +315,9 @@ def _scan_inbox(project_dir: str, rules: list[LifecycleRule], profile: dict) -> 
 
 def _scan_contract(project_dir: str, rules: list[LifecycleRule], profile: dict) -> int:
     from superharness.engine import state_reader, state_writer
+    from superharness.engine.reliable_orchestrator_gate import (
+        is_reliable_orchestrated_task,
+    )
 
     try:
         tasks = state_reader.get_tasks(project_dir)
@@ -320,6 +328,8 @@ def _scan_contract(project_dir: str, rules: list[LifecycleRule], profile: dict) 
     changed = 0
     for task in tasks:
         if not isinstance(task, dict):
+            continue
+        if is_reliable_orchestrated_task(task):
             continue
         original_status = task.get("status")
         for rule in rules:
@@ -417,6 +427,9 @@ def _check_deadlines(project_dir: str, profile: dict) -> int:
     Returns count of tasks failed due to deadline expiry.
     """
     from superharness.engine import state_reader, state_writer
+    from superharness.engine.reliable_orchestrator_gate import (
+        is_reliable_orchestrated_task,
+    )
 
     # Allow profile override for a project-wide default deadline
     default_deadline = None
@@ -460,6 +473,8 @@ def _check_deadlines(project_dir: str, profile: dict) -> int:
     try:
         for task in tasks:
             if not isinstance(task, dict):
+                continue
+            if is_reliable_orchestrated_task(task):
                 continue
             status = str(task.get("status", ""))
             if status not in _DEADLINE_ELIGIBLE_STATES:

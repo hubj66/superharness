@@ -270,6 +270,35 @@ def transition_run(
     return cursor.rowcount > 0
 
 
+def record_run_execution(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    pid: int | None = None,
+    pid_starttime: str | None = None,
+    worktree_path: str | None = None,
+    log_path: str | None = None,
+) -> RunRow:
+    """Persist dispatcher facts without changing lifecycle status."""
+    if get_run(conn, run_id) is None:
+        raise StateError(f"Run '{run_id}' not found")
+    values = {
+        "pid": pid,
+        "pid_starttime": pid_starttime,
+        "worktree_path": worktree_path,
+        "log_path": log_path,
+    }
+    assignments = ", ".join(f"{key}=?" for key in values)
+    conn.execute(
+        f"UPDATE runs SET {assignments} WHERE id=?",
+        [*values.values(), run_id],
+    )
+    updated = get_run(conn, run_id)
+    if updated is None:
+        raise StateError(f"Run '{run_id}' disappeared while recording execution")
+    return updated
+
+
 def record_run_result(
     conn: sqlite3.Connection,
     run_id: str,

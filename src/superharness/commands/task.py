@@ -681,10 +681,15 @@ def status_update(
     # Only fires for the implementation workflow — quick/note/review/discussion tasks
     # have no plan cycle, and auto-approving them causes a permanent dispatch block
     # because plan_approved is not in their allowed dispatch status set.
+    from superharness.engine.reliable_orchestrator_gate import (
+        is_reliable_orchestrated_task,
+    )
+
     if (
         status == "plan_proposed"
         and not _recursion_guard
         and task_row.workflow == "implementation"
+        and not is_reliable_orchestrated_task(task_row)
     ):
         profile_path = os.path.join(project_dir, ".superharness", "profile.yaml")
         auto_approve = False

@@ -465,8 +465,11 @@ def test_migration_from_v39_database_succeeds():
 
     init_db(conn)
 
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 40
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 41
     assert conn.execute("SELECT name FROM sqlite_master WHERE name='runs'").fetchone()
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE name='orchestrator_lease'"
+    ).fetchone()
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(inbox)").fetchall()}
     assert "run_id" in columns
     conn.close()

@@ -67,6 +67,7 @@ class DispatchContext:
     classification_explain: str = ""
     is_discussion: bool = False
     prelaunch_failure_reason: str = ""
+    run_id: str | None = None
 
 
 def _get_python() -> str:
@@ -744,18 +745,29 @@ def _sqlite_claim_next(project_dir: str, target_agent: str, now: str) -> dict | 
     """
     try:
         from dataclasses import asdict
-        from superharness.engine.db import get_connection, init_db
+        from superharness.engine.db import get_connection, init_db, transaction
         from superharness.engine import inbox_dao
+        from superharness.engine import runs_dao
 
         conn = get_connection(project_dir)
         try:
             init_db(conn)
-            row = inbox_dao.claim_next(
-                conn, target_agent=target_agent, pid=os.getpid(), now=now
-            )
-            if row is None:
-                return None
-            conn.commit()
+            with transaction(conn):
+                row = inbox_dao.claim_next(
+                    conn, target_agent=target_agent, pid=os.getpid(), now=now
+                )
+                if row is None:
+                    return None
+                if row.run_id:
+                    run = runs_dao.get_run(conn, row.run_id)
+                    if run is None:
+                        raise RuntimeError(
+                            f"linked inbox row {row.id} references missing run {row.run_id}"
+                        )
+                    if run.status == "queued":
+                        runs_dao.transition_run(
+                            conn, run.id, to_status="claimed", now=now
+                        )
             d = asdict(row)
             return {
                 "id": d["id"],
@@ -766,6 +778,7 @@ def _sqlite_claim_next(project_dir: str, target_agent: str, now: str) -> dict | 
                 "max_retries": d["max_retries"],
                 "priority": d["priority"],
                 "plan_only": d["plan_only"],
+                "run_id": d["run_id"],
             }
         finally:
             conn.close()
@@ -872,6 +885,11 @@ def _do_dispatch(
     # 3. Resolve
     rc = _resolve_execution_context(ctx)
     if rc is not None:
+        if _reliable_run(ctx):
+            ctx.launcher_rc = 2
+            _reliable_run_finished(ctx)
+            _clear_claimed_inbox_pid(ctx.project_dir, ctx.item_id)
+            return 1
         if ctx.prelaunch_failure_reason:
             ctx.launcher_rc = 2
             ctx.launch_start = time.time()
@@ -903,6 +921,11 @@ def _do_dispatch(
     # 6. Execute
     _execute_agent(ctx)
 
+    # Reliable runs report execution facts directly.  Legacy dispatch continues
+    # through its existing task-state reconciliation below.
+    if _reliable_run(ctx):
+        _reliable_run_finished(ctx)
+
     # 7. Cleanup
     if ctx.worktree_dir:
         worktree_source = ctx.worktree_source_dir or ctx.project_dir
@@ -915,6 +938,9 @@ def _do_dispatch(
             )
 
     # 8. Post-process
+    if _reliable_run(ctx):
+        return 0 if ctx.launcher_rc == 0 else 1
+
     if ctx.launcher_rc != 0:
         return _handle_failure(ctx)
 
@@ -978,10 +1004,143 @@ def _claim_next_item(ctx: DispatchContext) -> int | None:
     ctx.item_to = str(item.get("to", ""))
     ctx.item_task = str(item.get("task", ""))
     ctx.item_project = str(item.get("project", "") or ctx.project_dir)
+    ctx.run_id = str(item.get("run_id") or "") or None
     if not ctx.item_project:
         ctx.item_project = ctx.project_dir
 
     return None
+
+
+def _reliable_run(ctx: DispatchContext) -> bool:
+    return bool(ctx.run_id)
+
+
+def _pid_starttime(pid: int) -> str | None:
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as stat_file:
+            fields = stat_file.read().split()
+        return fields[21] if len(fields) > 21 else None
+    except OSError:
+        return None
+
+
+def _git_snapshot(path: str) -> dict[str, object]:
+    def run(*args: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", path, *args],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.stdout.strip() if result.returncode == 0 else None
+        except OSError:
+            return None
+
+    head = run("rev-parse", "HEAD")
+    branch = run("symbolic-ref", "--short", "HEAD") or run("rev-parse", "--short", "HEAD")
+    dirty_output = run("status", "--porcelain", "--untracked-files=normal")
+    return {
+        "branch_name": branch,
+        "base_sha": head,
+        "head_sha": head,
+        "dirty": bool(dirty_output),
+    }
+
+
+def _reliable_run_started(ctx: DispatchContext, pid: int | None = None) -> None:
+    if not _reliable_run(ctx):
+        return
+    from superharness.engine import runs_dao
+    from superharness.engine.db import get_connection, init_db, transaction
+
+    conn = get_connection(ctx.project_dir)
+    try:
+        init_db(conn)
+        with transaction(conn):
+            run = runs_dao.get_run(conn, ctx.run_id or "")
+            if run is None:
+                raise RuntimeError(f"run {ctx.run_id} disappeared before launch")
+            if run.status == "claimed":
+                runs_dao.transition_run(
+                    conn, run.id, to_status="running", now=_now_utc()
+                )
+            runs_dao.record_run_execution(
+                conn,
+                run.id,
+                pid=pid,
+                pid_starttime=_pid_starttime(pid) if pid else None,
+                worktree_path=ctx.exec_project or ctx.project_dir,
+                log_path=ctx.task_log or None,
+            )
+    finally:
+        conn.close()
+
+
+def _reliable_run_finished(ctx: DispatchContext) -> None:
+    """Persist dispatcher facts and close the linked inbox row."""
+    if not _reliable_run(ctx) or ctx.print_only:
+        return
+    from superharness.engine import inbox_dao, runs_dao
+    from superharness.engine.db import get_connection, init_db, transaction
+
+    snapshot = _git_snapshot(ctx.exec_project or ctx.project_dir)
+    conn = get_connection(ctx.project_dir)
+    try:
+        init_db(conn)
+        with transaction(conn):
+            run = runs_dao.get_run(conn, ctx.run_id or "")
+            if run is None:
+                raise RuntimeError(f"run {ctx.run_id} disappeared before completion")
+            success = ctx.launcher_rc == 0
+            if success and run.status == "claimed":
+                runs_dao.transition_run(conn, run.id, to_status="running", now=_now_utc())
+                run = runs_dao.get_run(conn, run.id) or run
+            result_snapshot = dict(snapshot)
+            if success:
+                result_snapshot["worktree_path"] = ctx.exec_project or ctx.project_dir
+                for key in ("branch_name", "base_sha", "head_sha"):
+                    if not result_snapshot.get(key):
+                        result_snapshot[key] = "unknown"
+                result_snapshot.setdefault("dirty", False)
+            payload = {
+                "schema_version": 1,
+                "run_id": run.id,
+                "task_id": run.task_id,
+                "kind": run.kind,
+                "agent": run.agent,
+                "exit_code": ctx.launcher_rc,
+                "completion_status": "completed" if success else "failed",
+                **result_snapshot,
+            }
+            runs_dao.record_run_result(conn, run.id, payload, now=_now_utc())
+            if run.status in {"claimed", "running"}:
+                runs_dao.transition_run(
+                    conn,
+                    run.id,
+                    to_status="succeeded" if success else "failed",
+                    now=_now_utc(),
+                    failure_category=None if success else "dispatcher_failure",
+                    failure_detail=None if success else f"exit code {ctx.launcher_rc}",
+                )
+            if run.inbox_id:
+                inbox_dao.update_status(
+                    conn,
+                    run.inbox_id,
+                    from_status="launched",
+                    to_status="done" if success else "failed",
+                    now=_now_utc(),
+                    reason=None if success else f"exit code {ctx.launcher_rc}",
+                ) or inbox_dao.update_status(
+                    conn,
+                    run.inbox_id,
+                    from_status="running",
+                    to_status="done" if success else "failed",
+                    now=_now_utc(),
+                    reason=None if success else f"exit code {ctx.launcher_rc}",
+                )
+    finally:
+        conn.close()
 
 
 def _transition_to_launched(ctx: DispatchContext, lock: _MkdirLock) -> int | None:
@@ -1951,6 +2110,7 @@ def _execute_agent(ctx: DispatchContext) -> None:
 
         ctx.launch_start = _time.time()
         if ctx.effective_timeout > 0:
+            _reliable_run_started(ctx)
             ctx.launcher_rc = _run_with_timeout(
                 ctx.effective_timeout,
                 ctx.wrapped_args,
@@ -1963,6 +2123,7 @@ def _execute_agent(ctx: DispatchContext) -> None:
             proc = subprocess.Popen(
                 ctx.wrapped_args, preexec_fn=_preexec, env=ctx.spawn_env
             )
+            _reliable_run_started(ctx, proc.pid)
             _inbox_cmd(
                 [
                     "set_field",
@@ -2060,6 +2221,8 @@ def _prepare_execution(ctx: DispatchContext) -> None:
     # Force Python launcher to flush stdout/stderr immediately — prevents line-dropping
     # when the process is wrapped in a PTY (script command) under load.
     spawn_env["PYTHONUNBUFFERED"] = "1"
+    if ctx.run_id:
+        spawn_env["SUPERHARNESS_RUN_ID"] = ctx.run_id
     if ctx.non_interactive:
         spawn_env["SUPERHARNESS_CONFIRM_NON_INTERACTIVE"] = "YES"
     # When dispatching from a git worktree, preserve the original project path

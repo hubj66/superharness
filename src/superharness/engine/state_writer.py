@@ -217,9 +217,14 @@ def set_task_status(
                 logger.warning("state_writer unexpected error: %s", e, exc_info=True)
         # Guard: active states must have matching inbox item
         if status in _ACTIVE_WORK_STATES:
-            _ensure_active_inbox(
-                project_dir, task_id, task_row.owner or "claude-code", now
+            from superharness.engine.reliable_orchestrator_gate import (
+                is_reliable_orchestrated_task,
             )
+
+            if not is_reliable_orchestrated_task(task_row):
+                _ensure_active_inbox(
+                    project_dir, task_id, task_row.owner or "claude-code", now
+                )
 
         # I5.4: Auto-record review on terminal statuses
         if status in ("done", "review_passed", "failed", "stopped"):

@@ -17,7 +17,7 @@ from superharness.utils.paths import (
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = 40
+CURRENT_SCHEMA_VERSION = 41
 
 # Journal modes SQLite accepts; used to validate the SUPERHARNESS_JOURNAL_MODE
 # override before it is interpolated into a PRAGMA (guards against injection/typos).
@@ -1999,6 +1999,24 @@ def _migration_v40(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_inbox_run_id ON inbox(run_id)")
 
 
+def _migration_v41(conn: sqlite3.Connection) -> None:
+    """Add the singleton lease used by the reliable orchestrator watcher."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS orchestrator_lease (
+            name          TEXT PRIMARY KEY,
+            owner_id      TEXT NOT NULL,
+            host          TEXT,
+            pid           INTEGER,
+            pid_starttime TEXT,
+            acquired_at   TEXT NOT NULL,
+            heartbeat_at  TEXT NOT NULL,
+            expires_at    TEXT NOT NULL
+        )
+        """
+    )
+
+
 _MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migration_v1,
     _migration_v2,
@@ -2040,4 +2058,5 @@ _MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migration_v38,
     _migration_v39,
     _migration_v40,
+    _migration_v41,
 ]

@@ -15,6 +15,8 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from superharness.engine.reliable_orchestrator_gate import is_reliable_orchestrated_task as _is_reliable_task
+from superharness.engine.reliable_watcher import is_reliable_task_id as _is_reliable_task_id, reliable_task_ids, release as _reliable_release, tick as _reliable_tick
 if TYPE_CHECKING:
     from superharness.engine import live_state
 
@@ -34,7 +36,7 @@ def _load_tasks(project_dir: str) -> list[dict]:
     try:
         from superharness.engine.state_reader import get_tasks
 
-        return get_tasks(project_dir)
+        return [task for task in get_tasks(project_dir) if not _is_reliable_task(task)]
     except Exception as e:
         logger.warning("inbox_watch unexpected error: %s", e, exc_info=True)
         return []
@@ -1478,6 +1480,7 @@ def _auto_retry_failed_sqlite(project_dir: str) -> None:
             init_db(conn)
             failed = inbox_dao.get_all(conn, status="failed")
             for row in failed:
+                if _is_reliable_task_id(conn, row.task_id): continue
                 if row.retry_count < row.max_retries:
                     new_count = row.retry_count + 1
                     # Preserve the original failure reason so operator can see it
@@ -1768,6 +1771,7 @@ def _auto_fallback_owner_reassign(project_dir: str) -> None:
             reassigned = 0
 
             for row in failed:
+                if _is_reliable_task_id(conn, row.task_id): continue
                 if row.retry_count < row.max_retries:
                     continue  # still has retries — handled by _auto_retry_failed
 
@@ -1859,6 +1863,7 @@ def _auto_recover_exhausted_failures_sqlite(project_dir: str) -> None:
             escalated = 0
 
             for row in failed:
+                if _is_reliable_task_id(conn, row.task_id): continue
                 if row.retry_count < row.max_retries:
                     continue  # _auto_retry_failed handles these
 
@@ -1948,7 +1953,6 @@ def _auto_recover_exhausted_failures_sqlite(project_dir: str) -> None:
                 task = tasks_dao.get(conn, row.task_id)
                 if task is None or task.status in ("done", "stopped", "archived"):
                     continue
-
                 # Determine fallback agent — skip owners already tried on this task
                 current_agent = row.target_agent
                 tried_agents: set[str] = set()
@@ -2132,6 +2136,7 @@ def _reconcile_permanent_blocks(project_dir: str) -> int:
             init_db(conn)
             failed = inbox_dao.get_all(conn, status="failed")
             for row in failed:
+                if _is_reliable_task_id(conn, row.task_id): continue
                 if row.retry_count < row.max_retries:
                     continue
                 reason = (row.failed_reason or "").lower()
@@ -2840,6 +2845,10 @@ def _run_scripts(
     # SQLite tick: drain dual-write queue + record heartbeat
     _sqlite_tick(project_dir, _now_utc())
 
+    # Reliable-orchestrator tasks have one lifecycle owner.  The lease is
+    # independent of the legacy watcher singleton during the migration.
+    _reliable_tick(project_dir, _now_utc(), _log_watcher_error)
+
     # Operator commands: process pending approve/reject requests (gateway or retry)
     try:
         _poll_operator_commands(project_dir)
@@ -3063,7 +3072,9 @@ def _run_scripts(
         try:
             init_db(conn_paused)
             paused_items = [
-                asdict(r) for r in inbox_dao.get_all(conn_paused, status="paused")
+                asdict(r)
+                for r in inbox_dao.get_all(conn_paused, status="paused")
+                if not r.run_id
             ]
             if _reconcile_paused_dead_pids(paused_items):
                 for item in paused_items:
@@ -3435,6 +3446,8 @@ def _analyze_task_logs(project_dir: str) -> None:
         escalated = 0
 
         for item in launched:
+            if item.run_id and item.run_id.strip():
+                continue
             d = asdict(item)
             launched_at = d.get("launched_at", "")
             if not launched_at:
@@ -3716,6 +3729,8 @@ def _reconcile_zombies(project_dir: str, max_age_seconds: int = 300) -> int:
 
         task_id = str(item.get("task", ""))
         item_id = str(item.get("id", ""))
+        if task_id in reliable_task_ids(project_dir):
+            continue
         pid = item.get("pid", "")
         launched_at = str(item.get("launched_at", ""))
 
@@ -4404,7 +4419,8 @@ def _maybe_pause_agent(
     paused_now = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     cursor = conn.execute(
         """UPDATE inbox SET status='paused', paused_at=?, failed_reason=?
-           WHERE target_agent=? AND status IN ('pending','launched')""",
+           WHERE target_agent=? AND status IN ('pending','launched')
+             AND run_id IS NULL""",
         (
             paused_now,
             f"reinforce: fleet-classified permanent_block after {failure_count} failures",
@@ -4954,7 +4970,7 @@ def _gc_duplicate_inbox(project_dir: str) -> int:
             dupes = conn.execute("""
                 SELECT task_id, target_agent, COUNT(*) as cnt
                 FROM inbox
-                WHERE status = 'pending'
+                WHERE status = 'pending' AND run_id IS NULL
                 GROUP BY task_id, target_agent
                 HAVING cnt > 1
             """).fetchall()
@@ -4963,7 +4979,8 @@ def _gc_duplicate_inbox(project_dir: str) -> int:
                 task_id, agent = dupe["task_id"], dupe["target_agent"]
                 # Keep newest, cancel older
                 rows = conn.execute(
-                    "SELECT id FROM inbox WHERE task_id=? AND target_agent=? AND status='pending' ORDER BY created_at DESC",
+                    "SELECT id FROM inbox WHERE task_id=? AND target_agent=? "
+                    "AND status='pending' AND run_id IS NULL ORDER BY created_at DESC",
                     (task_id, agent),
                 ).fetchall()
                 for row in rows[1:]:  # skip newest
@@ -4995,7 +5012,7 @@ def _gc_zombie_running(project_dir: str) -> int:
         try:
             init_db(conn)
             rows = conn.execute(
-                "SELECT id, pid FROM inbox WHERE status='running'"
+                "SELECT id, pid FROM inbox WHERE status='running' AND run_id IS NULL"
             ).fetchall()
             cleaned = 0
             now = _now_utc()
@@ -5035,7 +5052,7 @@ def _gc_zombie_pending(project_dir: str) -> int:
             )
             cursor = conn.execute(
                 "UPDATE inbox SET status='done', failed_reason='gc: pending timeout (>15min)' "
-                "WHERE status='pending' AND created_at < ?",
+                "WHERE status='pending' AND run_id IS NULL AND created_at < ?",
                 (cutoff,),
             )
             cleaned = cursor.rowcount or 0
@@ -5271,6 +5288,8 @@ def _gc_stuck_waiting_input(project_dir: str) -> int:
             ).fetchall()
             cleaned = 0
             for row in stuck_rows:
+                if _is_reliable_task_id(conn, row["id"]):
+                    continue
                 result = _with_task_lock(
                     conn,
                     row["id"],
@@ -5339,7 +5358,8 @@ def _cancel_undispatchable_agents(project_dir: str) -> int:
         try:
             init_db(conn)
             rows = conn.execute(
-                "SELECT id, target_agent FROM inbox WHERE status='pending' AND target_agent NOT IN ({})".format(
+                "SELECT id, target_agent FROM inbox WHERE status='pending' AND run_id IS NULL "
+                "AND target_agent NOT IN ({})".format(
                     ",".join(f"'{a}'" for a in known_agents)
                 )
             ).fetchall()
@@ -5432,6 +5452,7 @@ def watch(
     _sqlite_singleton_acquire(project_dir)
 
     def _on_exit(signum: int = 0, frame: object = None) -> None:
+        _reliable_release(project_dir)
         _sqlite_singleton_release(project_dir)
         _release_watcher_lock(lock_dir)
         if signum:
@@ -5465,6 +5486,7 @@ def watch(
             def _stop(signum: int, frame: object) -> None:
                 running[0] = False
                 print("\nWatcher stopped.")
+                _reliable_release(project_dir)
                 _sqlite_singleton_release(project_dir)
                 _release_watcher_lock(lock_dir)
                 sys.exit(0)
