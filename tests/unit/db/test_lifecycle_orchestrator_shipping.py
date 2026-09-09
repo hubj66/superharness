@@ -126,10 +126,8 @@ def test_confirmed_ship_moves_task_to_pr_open_once(tmp_path):
         assert len(ship_runs) == 1
         assert shipper.calls == 1
         assert ship_runs[0].remote_head_sha == "commit-sha"
-        assert task is not None and task.status == "pr_open"
-        assert "review" not in {
-            run.kind for run in runs_dao.list_runs_for_task(conn, "t1")
-        }
+        assert task is not None and task.status == "review_requested"
+        assert len(runs_dao.list_runs_for_task(conn, "t1", kind="review")) == 1
 
     finally:
         conn.close()
