@@ -6,9 +6,11 @@ Dispatches the next pending inbox item to its target launcher.
 from __future__ import annotations
 
 import importlib.resources as _importlib_resources
+import json
 import logging
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -1085,6 +1087,7 @@ def _reliable_run_finished(ctx: DispatchContext) -> None:
         return
     from superharness.engine import inbox_dao, runs_dao
     from superharness.engine.db import get_connection, init_db, transaction
+    from superharness.engine.state_errors import BoundaryError, StateError
 
     snapshot = _git_snapshot(ctx.exec_project or ctx.project_dir)
     conn = get_connection(ctx.project_dir)
@@ -1107,7 +1110,8 @@ def _reliable_run_finished(ctx: DispatchContext) -> None:
                     if not result_snapshot.get(key):
                         result_snapshot[key] = "unknown"
                 result_snapshot.setdefault("dirty", False)
-            payload = {
+            artifact_payload = _load_run_result_artifact(ctx)
+            payload = artifact_payload or {
                 "schema_version": 1,
                 "run_id": run.id,
                 "task_id": run.task_id,
@@ -1117,34 +1121,75 @@ def _reliable_run_finished(ctx: DispatchContext) -> None:
                 "completion_status": "completed" if success else "failed",
                 **result_snapshot,
             }
-            runs_dao.record_run_result(conn, run.id, payload, now=_now_utc())
+            try:
+                runs_dao.record_run_result(conn, run.id, payload, now=_now_utc())
+                result_valid = True
+            except (BoundaryError, ValueError, TypeError) as exc:
+                result_valid = False
+                runs_dao.record_run_diagnostic(
+                    conn,
+                    run.id,
+                    failure_category="invalid_run_result",
+                    failure_detail=str(exc),
+                )
+            terminal_success = success and result_valid
             if run.status in {"claimed", "running"}:
                 runs_dao.transition_run(
                     conn,
                     run.id,
-                    to_status="succeeded" if success else "failed",
+                    to_status="succeeded" if terminal_success else "failed",
                     now=_now_utc(),
-                    failure_category=None if success else "dispatcher_failure",
-                    failure_detail=None if success else f"exit code {ctx.launcher_rc}",
+                    failure_category=None if terminal_success else "dispatcher_failure",
+                    failure_detail=None
+                    if terminal_success
+                    else (
+                        "invalid structured result"
+                        if success
+                        else f"exit code {ctx.launcher_rc}"
+                    ),
                 )
             if run.inbox_id:
                 inbox_dao.update_status(
                     conn,
                     run.inbox_id,
                     from_status="launched",
-                    to_status="done" if success else "failed",
+                    to_status="done" if terminal_success else "failed",
                     now=_now_utc(),
-                    reason=None if success else f"exit code {ctx.launcher_rc}",
+                    reason=None
+                    if terminal_success
+                    else (
+                        "invalid structured result"
+                        if success
+                        else f"exit code {ctx.launcher_rc}"
+                    ),
                 ) or inbox_dao.update_status(
                     conn,
                     run.inbox_id,
                     from_status="running",
-                    to_status="done" if success else "failed",
+                    to_status="done" if terminal_success else "failed",
                     now=_now_utc(),
-                    reason=None if success else f"exit code {ctx.launcher_rc}",
+                    reason=None
+                    if terminal_success
+                    else (
+                        "invalid structured result"
+                        if success
+                        else f"exit code {ctx.launcher_rc}"
+                    ),
                 )
     finally:
         conn.close()
+
+
+def _load_run_result_artifact(ctx: DispatchContext) -> dict[str, object] | None:
+    path = ctx.spawn_env.get("SUPERHARNESS_RUN_RESULT_PATH", "")
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def _transition_to_launched(ctx: DispatchContext, lock: _MkdirLock) -> int | None:
@@ -2192,6 +2237,29 @@ def _prepare_execution(ctx: DispatchContext) -> None:
         )
     if task_status == "review_requested":
         launch_args.append("--for-review")
+    run_prompt = ""
+    run_model = ""
+    if ctx.run_id:
+        from superharness.engine.state_errors import StateError
+
+        try:
+            from superharness.engine import runs_dao
+            from superharness.engine.db import managed_connection
+
+            with managed_connection(ctx.project_dir) as conn:
+                run = runs_dao.get_run(conn, ctx.run_id)
+            if run is not None:
+                run_model = run.model or ""
+                prompt_value = run.result_json.get("prompt")
+                run_prompt = prompt_value if isinstance(prompt_value, str) else ""
+        except (OSError, sqlite3.Error, StateError) as _e:
+            _log.warning(
+                "_prepare_execution: could not read linked run metadata: %s",
+                _e,
+                exc_info=True,
+            )
+    if run_model:
+        launch_args.extend(["--model", run_model])
     if bool(ctx.item.get("plan_only", False)):
         launch_args.append("--plan-only")
     elif ctx.non_interactive:
@@ -2230,6 +2298,13 @@ def _prepare_execution(ctx: DispatchContext) -> None:
     spawn_env["PYTHONUNBUFFERED"] = "1"
     if ctx.run_id:
         spawn_env["SUPERHARNESS_RUN_ID"] = ctx.run_id
+        result_dir = os.path.join(ctx.project_dir, ".superharness", "run-results")
+        os.makedirs(result_dir, exist_ok=True)
+        spawn_env["SUPERHARNESS_RUN_RESULT_PATH"] = os.path.join(
+            result_dir, f"{_safe_task_id_for_path(ctx.run_id)}.json"
+        )
+    if run_prompt:
+        spawn_env["SUPERHARNESS_RUN_PROMPT"] = run_prompt
     if ctx.non_interactive:
         spawn_env["SUPERHARNESS_CONFIRM_NON_INTERACTIVE"] = "YES"
     # When dispatching from a git worktree, preserve the original project path

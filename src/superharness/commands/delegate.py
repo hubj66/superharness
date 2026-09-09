@@ -1298,14 +1298,18 @@ def delegate(
         instructions_file = os.path.join(handoff_dir, f"{task_id}-instructions.md")
         user_instructions = ""
         if os.path.isfile(instructions_file):
-            user_instructions = (
-                Path(instructions_file).read_text(encoding="utf-8")  # shipguard:ignore state-read: user-supplied task instructions
-                .strip()
-            )
+            # Keep the suppression on the read call for the state-read ratchet.
+            # fmt: off
+            user_instructions = Path(instructions_file).read_text(encoding="utf-8")  # shipguard:ignore state-read: user-supplied task instructions; fmt: skip
+            # fmt: on
+            user_instructions = user_instructions.strip()
             if user_instructions:
                 user_instructions = (
                     f"\n\nUser instructions for this task:\n{user_instructions}"
                 )
+        run_prompt = os.environ.get("SUPERHARNESS_RUN_PROMPT", "").strip()
+        if run_prompt and os.environ.get("SUPERHARNESS_RUN_ID", "").strip():
+            user_instructions += f"\n\nRun instructions:\n{run_prompt}"
 
         # Build context hint to reduce cold-start exploration time
         context_hint = build_context_hint(project_dir, task_obj or {})
@@ -1455,9 +1459,7 @@ def delegate(
                         now=now_iso(),
                     )
             except (StateError, sqlite3.Error, OSError) as e:
-                logger.warning(
-                    "delegate.py failed to record dispatch context: %s", e
-                )
+                logger.warning("delegate.py failed to record dispatch context: %s", e)
 
             runner = SDKRunner(
                 project_dir=Path(project_dir),

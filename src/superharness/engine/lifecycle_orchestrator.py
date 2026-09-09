@@ -1,7 +1,7 @@
 """The feature-gated lifecycle owner for reliable-orchestrator tasks.
 
-Phase 3 ships successful implementation Runs to a confirmed PR head SHA, then
-stops at ``pr_open``.  It does not review, repair, fall back, or merge work.
+Phase 4 adds SHA-bound Codex review and Claude repair loops.  It does not
+fall back between implementation agents or merge work.
 """
 
 from __future__ import annotations
@@ -22,12 +22,18 @@ from superharness.engine.next_action import validate_status_transition
 from superharness.engine.reliable_orchestrator_gate import (
     is_reliable_orchestrated_task,
 )
-from superharness.engine.reliable_worktree import create_managed_worktree
+from superharness.engine.reliable_worktree import (
+    create_managed_worktree,
+    create_repair_worktree,
+    create_review_worktree,
+)
 from superharness.engine.run_results import validate_result_for_run
 from superharness.engine.shipper import SYSTEM_AGENT, SystemShipper
-from superharness.engine.state_errors import BoundaryError
+from superharness.engine.state_errors import BoundaryError, StateError
 
 _ACTIVE_INBOX_STATUSES = ("pending", "launched", "running", "paused")
+CODEX_REVIEW_AGENT = "codex-cli"
+DEFAULT_CODEX_REVIEW_MODEL = "gpt-5.5"
 
 
 def _now_utc() -> str:
@@ -52,12 +58,16 @@ class LifecycleOrchestrator:
         now: Callable[[], str] = _now_utc,
         primary_agent: str | None = None,
         auto_approve_plans: bool | None = None,
+        review_agent: str | None = None,
+        review_model: str | None = None,
         shipper_factory: Callable[[str], SystemShipper] | None = None,
     ) -> None:
         self.project_dir = os.path.realpath(project_dir)
         self._now = now
         self._primary_agent = primary_agent
         self._auto_approve = auto_approve_plans
+        self._review_agent = review_agent
+        self._review_model = review_model
         self._shipper_factory = shipper_factory or (
             lambda project: SystemShipper(project)
         )
@@ -123,30 +133,42 @@ class LifecycleOrchestrator:
                             transitions=result.transitions + 1,
                         )
                         task = tasks_dao.get(conn, task.id)
-                    if task is None or task.status != "plan_approved":
-                        continue
+                    if task is not None and task.status == "plan_approved":
+                        implementation_runs = runs_dao.list_runs_for_task(
+                            conn, task.id, kind="implement"
+                        )
+                        if not implementation_runs:
+                            plan_runs = runs_dao.list_runs_for_task(
+                                conn, task.id, kind="plan"
+                            )
+                            plan_token = plan_runs[-1].id if plan_runs else "manual"
+                            self._create_dispatch_run(
+                                conn,
+                                task,
+                                kind="implement",
+                                dedupe_key=f"implement:{task.id}:{plan_token}",
+                                parent_run_id=plan_runs[-1].id if plan_runs else None,
+                            )
+                            self._transition_task(conn, task, "in_progress")
+                            result = TickResult(
+                                inspected=result.inspected,
+                                runs_created=result.runs_created + 1,
+                                results_consumed=result.results_consumed,
+                                transitions=result.transitions + 1,
+                            )
 
-                    implementation_runs = runs_dao.list_runs_for_task(
-                        conn, task.id, kind="implement"
+                    task = tasks_dao.get(conn, task.id) if task is not None else None
+                    if task is None:
+                        continue
+                    review_created, review_transition = self._ensure_review_run(
+                        conn, task
                     )
-                    if not implementation_runs:
-                        plan_runs = runs_dao.list_runs_for_task(
-                            conn, task.id, kind="plan"
-                        )
-                        plan_token = plan_runs[-1].id if plan_runs else "manual"
-                        self._create_dispatch_run(
-                            conn,
-                            task,
-                            kind="implement",
-                            dedupe_key=f"implement:{task.id}:{plan_token}",
-                            parent_run_id=plan_runs[-1].id if plan_runs else None,
-                        )
-                        self._transition_task(conn, task, "in_progress")
+                    if review_created or review_transition:
                         result = TickResult(
                             inspected=result.inspected,
-                            runs_created=result.runs_created + 1,
+                            runs_created=result.runs_created + review_created,
                             results_consumed=result.results_consumed,
-                            transitions=result.transitions + 1,
+                            transitions=result.transitions + review_transition,
                         )
                 ship_runs_to_execute = self._queued_ship_runs(conn, task_id=task_id)
             for ship_run_id in ship_runs_to_execute:
@@ -178,7 +200,7 @@ class LifecycleOrchestrator:
         transitions = 0
         created = 0
         for run in runs_dao.list_unconsumed_finished_runs(conn, task_id=task.id):
-            if run.kind not in {"plan", "implement", "ship"}:
+            if run.kind not in {"plan", "implement", "repair", "ship", "review"}:
                 continue
             if run.status == "succeeded":
                 try:
@@ -188,16 +210,38 @@ class LifecycleOrchestrator:
                         else validate_result_for_run(run.result_json, run)
                     )
                 except (BoundaryError, ValueError, TypeError, json.JSONDecodeError):
+                    if run.kind == "review":
+                        runs_dao.record_run_diagnostic(
+                            conn,
+                            run.id,
+                            failure_category="invalid_review_result",
+                            failure_detail="review result failed run-bound validation",
+                        )
+                        self._terminalize_inbox(conn, run, failed=True)
+                        runs_dao.mark_run_consumed(conn, run.id, now=self._now())
+                        consumed += 1
                     # A malformed result remains visible for operator repair and
                     # cannot move task state.
                     continue
                 if result is not None and result.completion_status != "completed":
+                    if run.kind == "review":
+                        runs_dao.record_run_diagnostic(
+                            conn,
+                            run.id,
+                            failure_category="review_not_completed",
+                            failure_detail=f"completion_status={result.completion_status}",
+                        )
+                        self._terminalize_inbox(conn, run, failed=False)
+                        runs_dao.mark_run_consumed(conn, run.id, now=self._now())
+                        consumed += 1
                     continue
                 if run.kind == "plan" and task.status == "todo":
                     self._transition_task(conn, task, "plan_proposed")
                     transitions += 1
                     task = tasks_dao.get(conn, task.id) or task
-                elif run.kind == "implement" and task.status == "in_progress":
+                elif (
+                    run.kind in {"implement", "repair"} and task.status == "in_progress"
+                ):
                     self._create_ship_run(conn, task, run)
                     created += 1
                 elif (
@@ -213,13 +257,20 @@ class LifecycleOrchestrator:
                     task = tasks_dao.get(conn, task.id) or task
                     self._transition_task(conn, task, "pr_open")
                     transitions += 1
+                elif run.kind == "review":
+                    review_transitions, review_created = self._consume_review_result(
+                        conn, task, run, result
+                    )
+                    transitions += review_transitions
+                    created += review_created
+                    task = tasks_dao.get(conn, task.id) or task
             # Terminal failures are execution facts, not a task retry policy.
             # They are consumed so a later tick cannot repeatedly act on them.
-            if run.status != "succeeded" or run.kind in {"implement", "ship"}:
+            if run.status != "succeeded" or run.kind in {"implement", "repair", "ship"}:
                 self._terminalize_inbox(conn, run, failed=run.status != "succeeded")
                 runs_dao.mark_run_consumed(conn, run.id, now=self._now())
                 consumed += 1
-            elif run.kind == "plan":
+            elif run.kind in {"plan", "review"}:
                 self._terminalize_inbox(conn, run, failed=False)
                 runs_dao.mark_run_consumed(conn, run.id, now=self._now())
                 consumed += 1
@@ -240,6 +291,115 @@ class LifecycleOrchestrator:
             reason="run failed" if failed else None,
         )
 
+    def _ensure_review_run(self, conn, task: tasks_dao.TaskRow) -> tuple[int, int]:
+        if task.status not in {"pr_open", "review_requested"}:
+            return 0, 0
+        metadata = self._pr_metadata(task)
+        if metadata is None:
+            return 0, 0
+        review_target_sha = metadata["pr_head_sha"]
+        existing = [
+            run
+            for run in runs_dao.list_runs_for_task(conn, task.id, kind="review")
+            if run.review_target_sha == review_target_sha
+        ]
+        if existing:
+            return 0, 0
+        worktree = None
+        if self._is_git_repo():
+            try:
+                worktree = create_review_worktree(
+                    self.project_dir,
+                    task.id,
+                    branch_name=metadata["branch_name"],
+                    review_target_sha=review_target_sha,
+                )
+            except StateError:
+                return 0, 0
+        prompt = self._review_prompt(task, metadata)
+        self._create_dispatch_run(
+            conn,
+            task,
+            kind="review",
+            dedupe_key=f"review:{task.id}:{review_target_sha}",
+            agent=self._review_agent_name(),
+            model=self._review_model_name(),
+            review_target_sha=review_target_sha,
+            prompt=prompt,
+            worktree_path=worktree.path if worktree else None,
+            branch_name=metadata["branch_name"],
+            base_sha=review_target_sha,
+            head_sha=review_target_sha,
+            pr_number=metadata["pr_number"],
+            pr_url=metadata["pr_url"],
+        )
+        if task.status == "pr_open":
+            self._transition_task(conn, task, "review_requested")
+            return 1, 1
+        return 1, 0
+
+    def _consume_review_result(
+        self,
+        conn,
+        task: tasks_dao.TaskRow,
+        run: runs_dao.RunRow,
+        result: Any,
+    ) -> tuple[int, int]:
+        metadata = self._pr_metadata(task)
+        current_sha = metadata["pr_head_sha"] if metadata else None
+        reviewed_sha = getattr(result, "reviewed_sha", None)
+        verdict = getattr(result, "review_verdict", None)
+        if (
+            not current_sha
+            or not run.review_target_sha
+            or reviewed_sha != run.review_target_sha
+            or current_sha != run.review_target_sha
+        ):
+            detail = (
+                f"reviewed_sha={reviewed_sha!r}, "
+                f"review_target_sha={run.review_target_sha!r}, "
+                f"task_pr_head_sha={current_sha!r}"
+            )
+            runs_dao.record_run_diagnostic(
+                conn,
+                run.id,
+                failure_category="stale_review",
+                failure_detail=detail,
+            )
+            self._terminalize_inbox(conn, run, failed=False)
+            created, transitions = self._ensure_review_run(conn, task)
+            return transitions, created
+
+        self._record_review_metadata(conn, task, run, result)
+        task = tasks_dao.get(conn, task.id) or task
+        if verdict == "LGTM" and task.status == "review_requested":
+            self._transition_task(conn, task, "review_passed")
+            return 1, 0
+        if verdict == "REJECTED" and task.status == "review_requested":
+            self._transition_task(conn, task, "review_failed")
+            transitions = 1
+            task = tasks_dao.get(conn, task.id) or task
+            created = self._ensure_repair_run(conn, task, run, result)
+            task = tasks_dao.get(conn, task.id) or task
+            has_repair = any(
+                candidate.trigger_run_id == run.id
+                for candidate in runs_dao.list_runs_for_task(
+                    conn, task.id, kind="repair"
+                )
+            )
+            if has_repair and task.status == "review_failed":
+                self._transition_task(conn, task, "in_progress")
+                transitions += 1
+            return transitions, created
+        if verdict == "BLOCKED":
+            runs_dao.record_run_diagnostic(
+                conn,
+                run.id,
+                failure_category="review_blocked",
+                failure_detail="Codex review returned BLOCKED",
+            )
+        return 0, 0
+
     def _create_dispatch_run(
         self,
         conn,
@@ -247,12 +407,26 @@ class LifecycleOrchestrator:
         *,
         kind: str,
         dedupe_key: str,
+        agent: str | None = None,
+        model: str | None = None,
         parent_run_id: str | None = None,
+        trigger_run_id: str | None = None,
+        review_target_sha: str | None = None,
+        prompt: str | None = None,
+        worktree_path: str | None = None,
+        branch_name: str | None = None,
+        base_sha: str | None = None,
+        head_sha: str | None = None,
+        pr_number: int | None = None,
+        pr_url: str | None = None,
     ) -> runs_dao.RunRow:
-        agent = self._agent_for(task)
+        agent = agent or self._agent_for(task)
         worktree = None
-        if kind == "implement" and self._is_git_repo():
+        if kind == "implement" and self._is_git_repo() and worktree_path is None:
             worktree = create_managed_worktree(self.project_dir, task.id)
+            worktree_path = worktree.path
+            branch_name = worktree.branch_name
+            base_sha = worktree.base_sha
         run_id = "run-" + hashlib.sha256(dedupe_key.encode()).hexdigest()[:24]
         run = runs_dao.create_run(
             conn,
@@ -260,25 +434,34 @@ class LifecycleOrchestrator:
             task_id=task.id,
             kind=kind,
             agent=agent,
+            model=model,
             dedupe_key=dedupe_key,
             parent_run_id=parent_run_id,
-            worktree_path=worktree.path if worktree else None,
-            branch_name=worktree.branch_name if worktree else None,
-            base_sha=worktree.base_sha if worktree else None,
+            trigger_run_id=trigger_run_id,
+            worktree_path=worktree_path,
+            branch_name=branch_name,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            review_target_sha=review_target_sha,
+            result_json={"prompt": prompt} if prompt else None,
             now=self._now(),
         )
         if run.inbox_id is not None:
             return run
 
-        inbox = conn.execute(
-            """
-            SELECT id FROM inbox
-             WHERE task_id=? AND target_agent=? AND run_id IS NULL
-               AND status IN ('pending','launched','running','paused')
-             ORDER BY created_at ASC, id ASC LIMIT 1
-            """,
-            (task.id, agent),
-        ).fetchone()
+        inbox = None
+        if kind in {"plan", "implement"}:
+            inbox = conn.execute(
+                """
+                SELECT id FROM inbox
+                 WHERE task_id=? AND target_agent=? AND run_id IS NULL
+                   AND status IN ('pending','launched','running','paused')
+                 ORDER BY created_at ASC, id ASC LIMIT 1
+                """,
+                (task.id, agent),
+            ).fetchone()
         inbox_id = inbox["id"] if inbox else f"orchestrator-{run_id}"
         if inbox is None:
             inbox_dao.enqueue(
@@ -286,13 +469,83 @@ class LifecycleOrchestrator:
                 id=inbox_id,
                 task_id=task.id,
                 target_agent=agent,
-                project_path=worktree.path if worktree else self.project_dir,
+                project_path=worktree_path or self.project_dir,
                 plan_only=kind == "plan",
                 run_id=run.id,
                 now=self._now(),
             )
         runs_dao.link_inbox(conn, run_id=run.id, inbox_id=inbox_id)
         return runs_dao.get_run(conn, run.id) or run
+
+    def _ensure_repair_run(
+        self,
+        conn,
+        task: tasks_dao.TaskRow,
+        rejected_review_run: runs_dao.RunRow,
+        review_result: Any,
+    ) -> int:
+        existing = [
+            run
+            for run in runs_dao.list_runs_for_task(conn, task.id, kind="repair")
+            if run.trigger_run_id == rejected_review_run.id
+        ]
+        if existing:
+            return 0
+        metadata = self._pr_metadata(task)
+        if metadata is None:
+            runs_dao.record_run_diagnostic(
+                conn,
+                rejected_review_run.id,
+                failure_category="repair_blocked",
+                failure_detail="missing PR metadata for repair",
+            )
+            return 0
+        current_sha = metadata["pr_head_sha"]
+        if rejected_review_run.review_target_sha != current_sha:
+            runs_dao.record_run_diagnostic(
+                conn,
+                rejected_review_run.id,
+                failure_category="stale_review",
+                failure_detail=(
+                    f"rejected SHA {rejected_review_run.review_target_sha!r} "
+                    f"!= current PR head {current_sha!r}"
+                ),
+            )
+            return 0
+        worktree = None
+        if self._is_git_repo():
+            try:
+                worktree = create_repair_worktree(
+                    self.project_dir,
+                    task.id,
+                    branch_name=metadata["branch_name"],
+                    expected_head_sha=current_sha,
+                )
+            except StateError:
+                runs_dao.record_run_diagnostic(
+                    conn,
+                    rejected_review_run.id,
+                    failure_category="repair_blocked",
+                    failure_detail="repair worktree is not at the confirmed PR head",
+                )
+                return 0
+        prompt = self._repair_prompt(task, metadata, rejected_review_run, review_result)
+        self._create_dispatch_run(
+            conn,
+            task,
+            kind="repair",
+            dedupe_key=f"repair:{task.id}:{rejected_review_run.id}",
+            agent=self._agent_for(task),
+            trigger_run_id=rejected_review_run.id,
+            worktree_path=worktree.path if worktree else None,
+            branch_name=metadata["branch_name"],
+            base_sha=current_sha,
+            head_sha=current_sha,
+            pr_number=metadata["pr_number"],
+            pr_url=metadata["pr_url"],
+            prompt=prompt,
+        )
+        return 1
 
     def _create_ship_run(
         self, conn, task: tasks_dao.TaskRow, source_run: runs_dao.RunRow
@@ -312,6 +565,87 @@ class LifecycleOrchestrator:
             branch_name=source_run.branch_name,
             base_sha=source_run.head_sha,
             now=self._now(),
+        )
+
+    def _pr_metadata(self, task: tasks_dao.TaskRow) -> dict[str, Any] | None:
+        try:
+            extras = json.loads(task.extras_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(extras, dict):
+            return None
+        metadata = extras.get("reliable_orchestrator")
+        if not isinstance(metadata, dict):
+            return None
+        branch = metadata.get("branch_name")
+        pr_head_sha = (
+            metadata.get("pr_head_sha")
+            or metadata.get("remote_head_sha")
+            or metadata.get("head_sha")
+        )
+        pr_url = metadata.get("pr_url")
+        pr_number = metadata.get("pr_number")
+        if not isinstance(branch, str) or not branch:
+            return None
+        if not isinstance(pr_head_sha, str) or not pr_head_sha:
+            return None
+        if not isinstance(pr_url, str) or not pr_url:
+            return None
+        if not isinstance(pr_number, int):
+            return None
+        return {
+            "branch_name": branch,
+            "pr_head_sha": pr_head_sha,
+            "pr_number": pr_number,
+            "pr_url": pr_url,
+        }
+
+    def _review_prompt(self, task: tasks_dao.TaskRow, metadata: dict[str, Any]) -> str:
+        return "\n".join(
+            [
+                "=== RELIABLE ORCHESTRATOR CODE REVIEW ===",
+                "Review only. Do not modify code. Do not commit. Do not push.",
+                "Do not ship, merge, enable auto-merge, or close the task.",
+                "Inspect the full persisted task scope and the actual checked-out diff.",
+                "Treat the task row, issue URL, acceptance criteria, context, and locked contract as authoritative.",
+                "Do not treat the PR description as authoritative task scope.",
+                f"Task: {task.id} - {task.title}",
+                f"PR: {metadata['pr_url']} (#{metadata['pr_number']})",
+                f"Review target SHA: {metadata['pr_head_sha']}",
+                "Write the structured Superharness execution result JSON to SUPERHARNESS_RUN_RESULT_PATH.",
+                "The review_verdict must be LGTM, REJECTED, or BLOCKED.",
+                "The reviewed_sha must exactly equal the review target SHA.",
+                "If REJECTED, include concrete findings in the findings list.",
+            ]
+        )
+
+    def _repair_prompt(
+        self,
+        task: tasks_dao.TaskRow,
+        metadata: dict[str, Any],
+        review_run: runs_dao.RunRow,
+        review_result: Any,
+    ) -> str:
+        findings = getattr(review_result, "findings", []) or []
+        findings_text = "\n".join(f"- {item}" for item in findings) or "- none provided"
+        scope = "\n".join(f"- {item}" for item in task.acceptance_criteria) or "- none"
+        return "\n".join(
+            [
+                "=== RELIABLE ORCHESTRATOR REPAIR ===",
+                "Fix the same PR/task only. Do not make unrelated changes.",
+                "Do not manually push, ship, merge, enable auto-merge, or close the task.",
+                "System shipping owns commit, push, PR update, and SHA confirmation.",
+                f"Task: {task.id} - {task.title}",
+                f"Rejected review Run: {review_run.id}",
+                f"Reviewed SHA: {getattr(review_result, 'reviewed_sha', '')}",
+                f"Current PR head SHA: {metadata['pr_head_sha']}",
+                f"PR: {metadata['pr_url']} (#{metadata['pr_number']})",
+                "Authoritative acceptance criteria:",
+                scope,
+                "Rejected review findings:",
+                findings_text,
+                "Run appropriate focused tests and write the structured mutating Run result JSON to SUPERHARNESS_RUN_RESULT_PATH.",
+            ]
         )
 
     def _queued_ship_runs(self, conn, *, task_id: str | None = None) -> list[str]:
@@ -439,15 +773,21 @@ class LifecycleOrchestrator:
             extras = {}
         if not isinstance(extras, dict):
             extras = {}
-        extras["reliable_orchestrator"] = {
-            "branch_name": ship_run.branch_name,
-            "base_sha": ship_run.base_sha,
-            "head_sha": ship_run.head_sha,
-            "remote_head_sha": ship_run.remote_head_sha,
-            "pr_number": ship_run.pr_number,
-            "pr_url": ship_run.pr_url,
-            "ship_run_id": ship_run.id,
-        }
+        existing = extras.get("reliable_orchestrator")
+        existing_metadata = existing if isinstance(existing, dict) else {}
+        existing_metadata.update(
+            {
+                "branch_name": ship_run.branch_name,
+                "base_sha": ship_run.base_sha,
+                "head_sha": ship_run.head_sha,
+                "remote_head_sha": ship_run.remote_head_sha,
+                "pr_head_sha": ship_run.remote_head_sha,
+                "pr_number": ship_run.pr_number,
+                "pr_url": ship_run.pr_url,
+                "ship_run_id": ship_run.id,
+            }
+        )
+        extras["reliable_orchestrator"] = existing_metadata
         tasks_dao.update(
             conn,
             task.id,
@@ -456,6 +796,36 @@ class LifecycleOrchestrator:
                 "extras_json": json.dumps(extras),
                 "worktree_path": ship_run.worktree_path,
             },
+        )
+
+    def _record_review_metadata(
+        self,
+        conn,
+        task: tasks_dao.TaskRow,
+        review_run: runs_dao.RunRow,
+        review_result: Any,
+    ) -> None:
+        try:
+            extras = json.loads(task.extras_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            extras = {}
+        if not isinstance(extras, dict):
+            extras = {}
+        existing = extras.get("reliable_orchestrator")
+        metadata = existing if isinstance(existing, dict) else {}
+        metadata.update(
+            {
+                "last_review_run_id": review_run.id,
+                "last_review_verdict": getattr(review_result, "review_verdict", None),
+                "last_reviewed_head_sha": getattr(review_result, "reviewed_sha", None),
+            }
+        )
+        extras["reliable_orchestrator"] = metadata
+        tasks_dao.update(
+            conn,
+            task.id,
+            task.version,
+            {"extras_json": json.dumps(extras)},
         )
 
     def _is_git_repo(self) -> bool:
@@ -471,6 +841,7 @@ class LifecycleOrchestrator:
             "plan_proposed": "plan_proposed_at",
             "plan_approved": "plan_approved_at",
             "in_progress": "in_progress_at",
+            "review_requested": "review_requested_at",
         }
         if new_status in timestamp_columns:
             changes[timestamp_columns[new_status]] = now
@@ -493,6 +864,20 @@ class LifecycleOrchestrator:
         if self._auto_approve is not None:
             return self._auto_approve
         return bool(self._profile().get("auto_approve_plans", False))
+
+    def _review_agent_name(self) -> str:
+        if self._review_agent:
+            return self._review_agent
+        return str(self._profile().get("review_agent") or CODEX_REVIEW_AGENT)
+
+    def _review_model_name(self) -> str:
+        if self._review_model:
+            return self._review_model
+        return str(
+            self._profile().get("codex_review_model")
+            or self._profile().get("review_model")
+            or DEFAULT_CODEX_REVIEW_MODEL
+        )
 
     def _profile(self) -> dict[str, Any]:
         path = os.path.join(self.project_dir, ".superharness", "profile.yaml")

@@ -322,8 +322,6 @@ def record_run_result(
         "head_sha": parsed.head_sha,
         "review_verdict": parsed.review_verdict,
     }
-    if parsed.kind == "review" and parsed.reviewed_sha:
-        updates["review_target_sha"] = parsed.reviewed_sha
     if result_handoff_id is not None:
         updates["result_handoff_id"] = result_handoff_id
     if now is not None:
@@ -380,6 +378,36 @@ def record_ship_outcome(
     updated = get_run(conn, run_id)
     if updated is None:
         raise StateError(f"Run '{run_id}' disappeared while recording ship outcome")
+    return updated
+
+
+def record_run_diagnostic(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    failure_category: str | None = None,
+    failure_detail: str | None = None,
+    result_json: dict[str, Any] | None = None,
+) -> RunRow:
+    """Persist non-lifecycle diagnostic facts for a run."""
+    if get_run(conn, run_id) is None:
+        raise StateError(f"Run '{run_id}' not found")
+    updates: dict[str, Any] = {
+        "failure_category": failure_category,
+        "failure_detail": failure_detail,
+    }
+    if result_json is not None:
+        updates["result_json"] = json.dumps(result_json)
+    safe_updates = {key: value for key, value in updates.items() if value is not None}
+    if safe_updates:
+        assignments = ", ".join(f"{key}=?" for key in safe_updates)
+        conn.execute(
+            f"UPDATE runs SET {assignments} WHERE id=?",
+            [*safe_updates.values(), run_id],
+        )
+    updated = get_run(conn, run_id)
+    if updated is None:
+        raise StateError(f"Run '{run_id}' disappeared while recording diagnostics")
     return updated
 
 

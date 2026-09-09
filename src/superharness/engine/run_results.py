@@ -40,6 +40,7 @@ class ExecutionResult(BaseModel):
     changed_files: list[str] = Field(default_factory=list)
     review_verdict: ReviewVerdict | None = None
     reviewed_sha: str | None = None
+    findings: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _validate_review_fields(self) -> ExecutionResult:
@@ -74,7 +75,9 @@ class ExecutionResult(BaseModel):
         return self
 
 
-def parse_execution_result(payload: ExecutionResult | dict[str, Any]) -> ExecutionResult:
+def parse_execution_result(
+    payload: ExecutionResult | dict[str, Any],
+) -> ExecutionResult:
     if isinstance(payload, ExecutionResult):
         return payload
     return ExecutionResult.model_validate(payload)
@@ -102,7 +105,9 @@ def validate_result_for_run(
         if expected[field] is not None and actual[field] != expected[field]
     ]
     if mismatches:
-        raise BoundaryError("Execution result does not match run: " + "; ".join(mismatches))
+        raise BoundaryError(
+            "Execution result does not match run: " + "; ".join(mismatches)
+        )
 
     expected_review_sha = getattr(run, "review_target_sha", None)
     if (

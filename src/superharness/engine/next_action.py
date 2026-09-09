@@ -111,7 +111,7 @@ _MAPPING: dict[str, tuple[Optional[str], list[str], str]] = {
     ),
     "review_failed": (
         "plan_proposed",
-        ["plan_proposed", "todo"],
+        ["in_progress", "plan_proposed", "todo"],
         "revise the plan and re-propose",
     ),
     "done": (
@@ -150,8 +150,8 @@ _MAPPING: dict[str, tuple[Optional[str], list[str], str]] = {
         "task has been archived",
     ),
     "pr_open": (
-        "review_passed",
-        ["review_passed", "review_failed"],
+        "review_requested",
+        ["review_requested", "review_passed", "review_failed"],
         "review and merge the open PR",
     ),
 }

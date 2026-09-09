@@ -10,6 +10,8 @@ from superharness.engine import runs_dao, tasks_dao
 from superharness.engine.db import get_connection, init_db
 from superharness.engine.reliable_worktree import (
     create_managed_worktree,
+    create_repair_worktree,
+    create_review_worktree,
     reliable_task_branch,
 )
 from superharness.engine.shipper import CommandResult, SystemShipper
@@ -93,6 +95,25 @@ def _db(project: Path, worktree: Path, branch: str, head: str):
     return conn, task, source, ship
 
 
+def _db_source(
+    project: Path,
+    worktree: Path,
+    branch: str,
+    head: str,
+    *,
+    kind: str,
+):
+    conn, task, source, ship = _db(project, worktree, branch, head)
+    conn.execute(
+        "UPDATE runs SET kind=?, dedupe_key=? WHERE id=?",
+        (kind, f"{kind}:t1", source.id),
+    )
+    conn.commit()
+    source = runs_dao.get_run(conn, source.id)
+    assert source is not None
+    return conn, task, source, ship
+
+
 class FakeGh:
     def __init__(
         self,
@@ -172,6 +193,45 @@ def test_managed_worktree_uses_deterministic_branch_and_explicit_origin_base(tmp
     assert _run(worktree, "symbolic-ref", "--short", "HEAD") == branch
 
 
+def test_review_worktree_is_detached_at_exact_remote_pr_sha(tmp_path):
+    project, worktree, branch, base_sha = _shipping_fixture(tmp_path)
+    (worktree / "README.md").write_text("changed\n", encoding="utf-8")
+    _run(worktree, "add", "README.md")
+    _run(worktree, "commit", "-m", "change")
+    pr_head = _run(worktree, "rev-parse", "HEAD")
+    _run(worktree, "push", "origin", f"{branch}:{branch}")
+
+    review = create_review_worktree(
+        str(project), "t1", branch_name=branch, review_target_sha=pr_head
+    )
+    review_path = Path(review.path)
+
+    assert review.base_sha == pr_head
+    assert review.branch_name is None
+    assert _run(review_path, "rev-parse", "HEAD") == pr_head
+    assert _run(review_path, "branch", "--show-current") == ""
+    assert base_sha != pr_head
+
+
+def test_repair_worktree_resets_same_task_branch_to_current_remote_head(tmp_path):
+    project, worktree, branch, _base_sha = _shipping_fixture(tmp_path)
+    (worktree / "README.md").write_text("changed\n", encoding="utf-8")
+    _run(worktree, "add", "README.md")
+    _run(worktree, "commit", "-m", "change")
+    pr_head = _run(worktree, "rev-parse", "HEAD")
+    _run(worktree, "push", "origin", f"{branch}:{branch}")
+    _run(worktree, "reset", "--hard", "HEAD~1")
+
+    repair = create_repair_worktree(
+        str(project), "t1", branch_name=branch, expected_head_sha=pr_head
+    )
+
+    assert Path(repair.path) == worktree
+    assert repair.branch_name == branch
+    assert repair.base_sha == pr_head
+    assert _run(worktree, "rev-parse", "HEAD") == pr_head
+
+
 def test_shipper_commits_intended_files_excludes_control_plane_and_pushes_origin(
     tmp_path,
 ):
@@ -216,6 +276,34 @@ def test_existing_pr_is_reused_without_duplicate_create(tmp_path):
         assert outcome.ok
         assert outcome.pr_number == 7
         assert fake.pr_creates == 0
+    finally:
+        conn.close()
+
+
+def test_shipper_accepts_repair_but_rejects_fallback_until_phase_5(tmp_path):
+    project, worktree, branch, head = _shipping_fixture(tmp_path)
+    (worktree / "README.md").write_text("repair\n", encoding="utf-8")
+    conn, task, source, ship = _db_source(
+        project, worktree, branch, head, kind="repair"
+    )
+    try:
+        repair = SystemShipper(str(project), runner=FakeGh()).ship(
+            ship_run=ship, source_run=source, task=task
+        )
+        assert repair.ok
+    finally:
+        conn.close()
+
+    project, worktree, branch, head = _shipping_fixture(tmp_path / "fallback")
+    (worktree / "README.md").write_text("fallback\n", encoding="utf-8")
+    conn, task, source, ship = _db_source(
+        project, worktree, branch, head, kind="fallback"
+    )
+    try:
+        fallback = SystemShipper(str(project), runner=FakeGh()).ship(
+            ship_run=ship, source_run=source, task=task
+        )
+        assert fallback.failure_category == "invalid_worktree"
     finally:
         conn.close()
 
