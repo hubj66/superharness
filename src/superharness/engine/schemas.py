@@ -273,6 +273,7 @@ class InboxItem(BaseModel):
     pid: Optional[int] = None
     running_at: Optional[str] = None
     stopped_at: Optional[str] = None
+    run_id: Optional[str] = None
 
 
 class InboxDoc(BaseModel):

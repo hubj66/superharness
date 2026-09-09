@@ -29,6 +29,7 @@ class InboxRow:
     done_at: str | None
     reason: str | None = None
     type: str = "task"
+    run_id: str | None = None
 
 
 _ACTIVE_STATUSES = ("pending", "launched", "running", "paused")
@@ -46,6 +47,7 @@ def enqueue(
     plan_only: bool = False,
     model_override: str = "",
     type: str = "task",
+    run_id: str | None = None,
     now: str,
 ) -> InboxRow:
     """Insert a new inbox row with status='pending'.
@@ -53,6 +55,14 @@ def enqueue(
     Raises StateError if an active row already exists for (task_id, target_agent)
     to mirror the dedup guard on the YAML side.
     """
+    if run_id is not None:
+        run = conn.execute("SELECT task_id FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if run is None:
+            raise StateError(f"Run '{run_id}' not found")
+        if run["task_id"] != task_id:
+            raise StateError(
+                f"Run '{run_id}' belongs to task '{run['task_id']}', not '{task_id}'"
+            )
     placeholders = ",".join("?" * len(_ACTIVE_STATUSES))
     existing = conn.execute(
         f"SELECT id FROM inbox WHERE task_id=? AND target_agent=? AND status IN ({placeholders}) LIMIT 1",
@@ -82,8 +92,8 @@ def enqueue(
             """
             INSERT INTO inbox (
                 id, task_id, target_agent, status, priority, max_retries,
-                project_path, plan_only, type, created_at
-            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+                project_path, plan_only, type, run_id, created_at
+            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
             RETURNING *
             """,
             (
@@ -95,6 +105,7 @@ def enqueue(
                 project_path,
                 1 if plan_only else 0,
                 type,
+                run_id,
                 now,
             ),
         )
@@ -384,6 +395,7 @@ _VALID_FIELD_KEYS = frozenset(
         "done_at",
         "reason",
         "type",
+        "run_id",
     }
 )
 
@@ -460,4 +472,5 @@ def _row_to_inbox(row: sqlite3.Row) -> InboxRow:
         done_at=row["done_at"],
         reason=row["reason"] if "reason" in row.keys() else None,
         type=row["type"] if "type" in row.keys() else "task",
+        run_id=row["run_id"] if "run_id" in row.keys() else None,
     )

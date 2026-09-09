@@ -17,7 +17,7 @@ from superharness.utils.paths import (
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = 39
+CURRENT_SCHEMA_VERSION = 40
 
 # Journal modes SQLite accepts; used to validate the SUPERHARNESS_JOURNAL_MODE
 # override before it is interpolated into a PRAGMA (guards against injection/typos).
@@ -333,6 +333,7 @@ _ADDITIVE_COLUMN_MANIFEST: tuple[tuple[int, str, str, str], ...] = (
     (25, "agent_heartbeats", "cost_usd", "REAL"),
     (27, "discussions", "max_rounds", "INTEGER NOT NULL DEFAULT 3"),
     (30, "tasks", "issue_url", "TEXT"),
+    (40, "inbox", "run_id", "TEXT"),
 )
 
 
@@ -1883,6 +1884,121 @@ def _migration_v39(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v40(conn: sqlite3.Connection) -> None:
+    """Durable Run records for the reliable orchestrator foundation.
+
+    Phase 1 only introduces storage, invariants, and the nullable link from
+    legacy inbox rows to a future Run. Lifecycle policy remains in the legacy
+    watcher until the orchestrator is introduced behind a feature gate.
+    """
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runs (
+            id                         TEXT PRIMARY KEY,
+            task_id                    TEXT NOT NULL,
+            kind                       TEXT NOT NULL CHECK (
+                kind IN ('plan', 'implement', 'repair', 'fallback', 'ship', 'review')
+            ),
+            agent                      TEXT NOT NULL,
+            model                      TEXT,
+            status                     TEXT NOT NULL CHECK (
+                status IN (
+                    'queued', 'claimed', 'running', 'succeeded', 'failed',
+                    'crashed', 'timed_out', 'quota_blocked', 'cancelled'
+                )
+            ),
+            attempt                    INTEGER NOT NULL DEFAULT 1,
+            parent_run_id              TEXT,
+            trigger_run_id             TEXT,
+            inbox_id                   TEXT,
+            dedupe_key                 TEXT NOT NULL UNIQUE,
+            worktree_path              TEXT,
+            branch_name                TEXT,
+            base_sha                   TEXT,
+            head_sha                   TEXT,
+            remote_head_sha            TEXT,
+            pr_number                  INTEGER,
+            pr_url                     TEXT,
+            review_verdict             TEXT CHECK (
+                review_verdict IS NULL OR review_verdict IN ('LGTM', 'REJECTED', 'BLOCKED')
+            ),
+            review_target_sha          TEXT,
+            failure_category           TEXT,
+            failure_detail             TEXT,
+            exit_code                  INTEGER,
+            pid                        INTEGER,
+            pid_starttime              TEXT,
+            log_path                   TEXT,
+            result_handoff_id          INTEGER,
+            result_json                TEXT NOT NULL DEFAULT '{}',
+            orchestrator_consumed_at   TEXT,
+            created_at                 TEXT NOT NULL,
+            claimed_at                 TEXT,
+            started_at                 TEXT,
+            heartbeat_at               TEXT,
+            finished_at                TEXT,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY (parent_run_id) REFERENCES runs(id) ON DELETE SET NULL,
+            FOREIGN KEY (trigger_run_id) REFERENCES runs(id) ON DELETE SET NULL,
+            FOREIGN KEY (inbox_id) REFERENCES inbox(id) ON DELETE SET NULL,
+            FOREIGN KEY (result_handoff_id) REFERENCES handoffs(id) ON DELETE SET NULL,
+            CHECK (kind = 'review' OR review_verdict IS NULL),
+            CHECK (kind != 'review' OR review_target_sha IS NOT NULL)
+        )
+        """
+    )
+    if _table_exists(conn, "inbox"):
+        _add_column_if_missing(conn, "inbox", "run_id", "TEXT")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_active_mutating
+        ON runs(task_id)
+        WHERE kind IN ('plan', 'implement', 'repair', 'fallback', 'ship')
+          AND status IN ('queued', 'claimed', 'running')
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_active_review_per_sha
+        ON runs(task_id, review_target_sha)
+        WHERE kind = 'review'
+          AND status IN ('queued', 'claimed', 'running')
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_repair_per_trigger
+        ON runs(trigger_run_id)
+        WHERE kind = 'repair' AND trigger_run_id IS NOT NULL
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_inbox
+        ON runs(inbox_id)
+        WHERE inbox_id IS NOT NULL
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_task_status ON runs(task_id, status)")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_runs_unconsumed_finished
+        ON runs(task_id, finished_at)
+        WHERE finished_at IS NOT NULL AND orchestrator_consumed_at IS NULL
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_runs_review_target ON runs(task_id, review_target_sha)"
+    )
+    if _table_exists(conn, "inbox"):
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_one_run "
+            "ON inbox(run_id) WHERE run_id IS NOT NULL"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inbox_run_id ON inbox(run_id)")
+
+
 _MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migration_v1,
     _migration_v2,
@@ -1923,4 +2039,5 @@ _MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migration_v37,
     _migration_v38,
     _migration_v39,
+    _migration_v40,
 ]
