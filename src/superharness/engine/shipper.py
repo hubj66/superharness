@@ -146,7 +146,7 @@ class SystemShipper:
             )
         if source_run.status != "succeeded":
             return self._fail("invalid_worktree", "source Run did not succeed")
-        if source_run.kind not in {"implement", "repair"}:
+        if source_run.kind not in {"implement", "repair", "fallback"}:
             return self._fail("invalid_worktree", "source Run is not mutating code")
         if not is_reliable_orchestrated_task(task):
             return self._fail(

@@ -166,13 +166,8 @@ def current_process_identity() -> tuple[str, int, str | None, str]:
     """Return host, pid, Linux start time, and a stable owner id."""
     host = socket.gethostname()
     pid = __import__("os").getpid()
-    starttime: str | None = None
-    try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as stat_file:
-            fields = stat_file.read().split()
-        if len(fields) > 21:
-            starttime = fields[21]
-    except OSError:
-        pass
+    from superharness.engine.process import process_starttime
+
+    starttime = process_starttime(pid)
     owner_id = f"{host}:{pid}:{starttime or 'unknown'}"
     return host, pid, starttime, owner_id

@@ -39,6 +39,39 @@ from __future__ import annotations
 import os
 import signal
 import time
+from typing import Literal
+
+ProcessProbe = Literal["live", "dead", "reused", "unknown"]
+
+
+def process_starttime(pid: int) -> str | None:
+    """Read Linux proc start time, robust to spaces in the process name."""
+    if pid <= 0:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as stat_file:
+            contents = stat_file.read()
+        closing = contents.rfind(")")
+        if closing < 0:
+            return None
+        fields_after_comm = contents[closing + 2 :].split()
+        return fields_after_comm[19] if len(fields_after_comm) > 19 else None
+    except (OSError, ValueError):
+        return None
+
+
+def probe_process(pid: int | None, expected_starttime: str | None) -> ProcessProbe:
+    """Classify a persisted process identity without trusting PID alone."""
+    if pid is None or pid <= 0:
+        return "unknown"
+    if os.name != "nt":
+        actual = process_starttime(pid)
+        if actual is None:
+            return "dead"
+        if expected_starttime is None:
+            return "unknown"
+        return "live" if actual == expected_starttime else "reused"
+    return "live" if pid_alive(pid) else "dead"
 
 
 def pid_alive(pid: int) -> bool:

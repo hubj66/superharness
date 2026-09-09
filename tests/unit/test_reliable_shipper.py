@@ -280,7 +280,7 @@ def test_existing_pr_is_reused_without_duplicate_create(tmp_path):
         conn.close()
 
 
-def test_shipper_accepts_repair_but_rejects_fallback_until_phase_5(tmp_path):
+def test_shipper_accepts_repair_and_fallback_in_phase_5(tmp_path):
     project, worktree, branch, head = _shipping_fixture(tmp_path)
     (worktree / "README.md").write_text("repair\n", encoding="utf-8")
     conn, task, source, ship = _db_source(
@@ -303,7 +303,7 @@ def test_shipper_accepts_repair_but_rejects_fallback_until_phase_5(tmp_path):
         fallback = SystemShipper(str(project), runner=FakeGh()).ship(
             ship_run=ship, source_run=source, task=task
         )
-        assert fallback.failure_category == "invalid_worktree"
+        assert fallback.ok
     finally:
         conn.close()
 

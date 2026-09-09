@@ -23,10 +23,20 @@ from superharness.engine.reliable_orchestrator_gate import (
     is_reliable_orchestrated_task,
 )
 from superharness.engine.reliable_worktree import (
+    create_fallback_worktree,
     create_managed_worktree,
     create_repair_worktree,
     create_review_worktree,
+    current_branch_name,
+    is_managed_worktree_path,
+    reliable_task_branch,
+    rev_parse,
 )
+from superharness.engine.failure_classifier import (
+    ReliableFailureClassification,
+    classify_reliable,
+)
+from superharness.engine.process import probe_process
 from superharness.engine.run_results import validate_result_for_run
 from superharness.engine.shipper import SYSTEM_AGENT, SystemShipper
 from superharness.engine.state_errors import BoundaryError, StateError
@@ -34,6 +44,7 @@ from superharness.engine.state_errors import BoundaryError, StateError
 _ACTIVE_INBOX_STATUSES = ("pending", "launched", "running", "paused")
 CODEX_REVIEW_AGENT = "codex-cli"
 DEFAULT_CODEX_REVIEW_MODEL = "gpt-5.5"
+RELIABLE_HEARTBEAT_GRACE_SECONDS = 15 * 60
 
 
 def _now_utc() -> str:
@@ -80,6 +91,7 @@ class LifecycleOrchestrator:
             result = TickResult()
             ship_runs_to_execute: list[str] = []
             with transaction(conn):
+                self._reconcile_active_runs(conn, task_id=task_id)
                 tasks = [
                     tasks_dao.get(conn, task_id) if task_id else task
                     for task in ([None] if task_id else tasks_dao.get_all(conn))
@@ -200,7 +212,9 @@ class LifecycleOrchestrator:
         transitions = 0
         created = 0
         for run in runs_dao.list_unconsumed_finished_runs(conn, task_id=task.id):
-            if run.kind not in {"plan", "implement", "repair", "ship", "review"}:
+            if run.kind not in {
+                "plan", "implement", "repair", "fallback", "ship", "review"
+            }:
                 continue
             if run.status == "succeeded":
                 try:
@@ -240,7 +254,8 @@ class LifecycleOrchestrator:
                     transitions += 1
                     task = tasks_dao.get(conn, task.id) or task
                 elif (
-                    run.kind in {"implement", "repair"} and task.status == "in_progress"
+                    run.kind in {"implement", "repair", "fallback"}
+                    and task.status == "in_progress"
                 ):
                     self._create_ship_run(conn, task, run)
                     created += 1
@@ -264,17 +279,387 @@ class LifecycleOrchestrator:
                     transitions += review_transitions
                     created += review_created
                     task = tasks_dao.get(conn, task.id) or task
-            # Terminal failures are execution facts, not a task retry policy.
-            # They are consumed so a later tick cannot repeatedly act on them.
+            if run.status != "succeeded":
+                if self._run_owner_may_be_live(run):
+                    continue
+                failure_created, failure_transitions = self._route_failed_run(
+                    conn, task, run
+                )
+                created += failure_created
+                transitions += failure_transitions
             if run.status != "succeeded" or run.kind in {"implement", "repair", "ship"}:
                 self._terminalize_inbox(conn, run, failed=run.status != "succeeded")
                 runs_dao.mark_run_consumed(conn, run.id, now=self._now())
                 consumed += 1
-            elif run.kind in {"plan", "review"}:
+            elif run.kind in {"plan", "review", "fallback"}:
                 self._terminalize_inbox(conn, run, failed=False)
                 runs_dao.mark_run_consumed(conn, run.id, now=self._now())
                 consumed += 1
         return consumed, transitions, created
+
+    def _run_owner_may_be_live(self, run: runs_dao.RunRow) -> bool:
+        if run.pid is None:
+            return False
+        return probe_process(run.pid, run.pid_starttime) in {"live", "unknown"}
+
+    def _reconcile_active_runs(self, conn, *, task_id: str | None = None) -> None:
+        """Reconcile reliable Run facts after a watcher restart."""
+        for run in runs_dao.list_active_runs(conn, task_id=task_id):
+            task = tasks_dao.get(conn, run.task_id)
+            if task is None or not is_reliable_orchestrated_task(task):
+                continue
+            if run.status == "queued":
+                continue
+            if run.status == "claimed" and run.started_at is None:
+                row = inbox_dao.get(conn, run.inbox_id) if run.inbox_id else None
+                if row and row.status in {"launched", "running"}:
+                    runs_dao.record_run_diagnostic(
+                        conn,
+                        run.id,
+                        failure_category=run.failure_category or "lost_process",
+                        failure_detail=run.failure_detail
+                        or "dispatch claimed run but process identity was not persisted",
+                    )
+                    continue
+                runs_dao.transition_run(conn, run.id, to_status="queued", now=self._now())
+                continue
+            if run.status != "running":
+                continue
+
+            # A dispatcher may have persisted a complete result immediately
+            # before the watcher disappeared.
+            result_payload_present = any(
+                key in run.result_json
+                for key in ("schema_version", "run_id", "completion_status")
+            )
+            try:
+                result = validate_result_for_run(run.result_json, run)
+            except (BoundaryError, ValueError, TypeError, json.JSONDecodeError):
+                result = None
+                if result_payload_present:
+                    runs_dao.transition_run(
+                        conn,
+                        run.id,
+                        to_status="failed",
+                        now=self._now(),
+                        failure_category="invalid_result",
+                        failure_detail="persisted structured result is invalid",
+                    )
+                    continue
+            if result is not None and result.completion_status == "completed":
+                runs_dao.transition_run(conn, run.id, to_status="succeeded", now=self._now())
+                continue
+
+            process_state = probe_process(run.pid, run.pid_starttime)
+            if process_state == "live":
+                runs_dao.touch_run_heartbeat(
+                    conn,
+                    run.id,
+                    now=self._now(),
+                    pid=run.pid,
+                    pid_starttime=run.pid_starttime,
+                )
+                continue
+            if process_state in {"dead", "reused"} or self._heartbeat_expired(run):
+                category = "lost_process" if process_state in {"reused", "unknown"} else "agent_crash"
+                runs_dao.transition_run(
+                    conn,
+                    run.id,
+                    to_status="crashed",
+                    now=self._now(),
+                    failure_category=category,
+                    failure_detail=f"process probe: {process_state}",
+                )
+
+    def _heartbeat_expired(self, run: runs_dao.RunRow) -> bool:
+        stamp = run.heartbeat_at or run.started_at
+        if not stamp:
+            return False
+        try:
+            current = datetime.fromisoformat(self._now().replace("Z", "+00:00"))
+            previous = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            return (current - previous).total_seconds() > RELIABLE_HEARTBEAT_GRACE_SECONDS
+        except (TypeError, ValueError):
+            return False
+
+    def _route_failed_run(
+        self, conn, task: tasks_dao.TaskRow, run: runs_dao.RunRow
+    ) -> tuple[int, int]:
+        if run.kind in {"plan", "ship"}:
+            return 0, 0
+        classification = self._classify_run_failure(run)
+        runs_dao.record_run_diagnostic(
+            conn,
+            run.id,
+            failure_category=classification.category,
+            failure_detail=classification.explain,
+        )
+        if run.kind == "review":
+            if run.attempt < 2 and self._create_retry_run(conn, task, run):
+                return 1, 0
+            return 0, 0
+
+        if run.agent in {"claude", "claude-code"}:
+            if classification.category == "auth":
+                return 0, self._move_task(conn, task, "blocked")
+            if classification.category == "network":
+                if run.attempt < 2 and self._create_retry_run(conn, task, run):
+                    return 1, 0
+                return 0, self._move_task(conn, task, "blocked")
+            if classification.category == "unknown" and run.attempt < 2:
+                if self._create_retry_run(conn, task, run):
+                    return 1, 0
+            if self._create_fallback_run(conn, task, run, classification.category):
+                return 1, 0
+            return 0, self._move_task(conn, task, "blocked")
+
+        if run.kind == "fallback" and run.agent == CODEX_REVIEW_AGENT:
+            if classification.category == "quota":
+                return 0, self._move_task(conn, task, "blocked")
+            if run.attempt < 2 and classification.category in {
+                "agent_crash", "network", "unknown", "timeout", "hang", "lost_process"
+            }:
+                if self._create_retry_run(conn, task, run):
+                    return 1, 0
+            return 0, self._move_task(conn, task, "failed")
+        return 0, 0
+
+    def _classify_run_failure(self, run: runs_dao.RunRow):
+        if run.status == "quota_blocked":
+            return ReliableFailureClassification(
+                "quota", run.failure_detail or "Run was blocked by agent quota"
+            )
+        explicit = {
+            "quota", "session_limit", "agent_crash", "timeout", "hang", "auth",
+            "network", "ship_failure", "invalid_result", "lost_process",
+        }
+        if run.failure_category in explicit:
+            return ReliableFailureClassification(
+                run.failure_category, run.failure_detail or run.failure_category
+            )
+        return classify_reliable(
+            launcher_rc=run.exit_code,
+            error_text=run.failure_detail or "",
+            timed_out=run.status == "timed_out",
+            lost_process=run.status == "crashed",
+            invalid_result=run.failure_category == "dispatcher_failure",
+        )
+
+    def _move_task(self, conn, task: tasks_dao.TaskRow, status: str) -> int:
+        current = tasks_dao.get(conn, task.id) or task
+        if current.status != status:
+            self._transition_task(conn, current, status)
+            return 1
+        return 0
+
+    def _create_retry_run(
+        self, conn, task: tasks_dao.TaskRow, failed_run: runs_dao.RunRow
+    ) -> bool:
+        metadata = self._pr_metadata(task)
+        worktree_path = failed_run.worktree_path
+        branch_name = failed_run.branch_name
+        base_sha = failed_run.base_sha
+        head_sha = failed_run.head_sha
+        target_sha = failed_run.review_target_sha
+        if failed_run.kind == "review" and target_sha:
+            if not metadata:
+                metadata = {
+                    "branch_name": failed_run.branch_name or "",
+                    "pr_head_sha": target_sha,
+                    "pr_number": failed_run.pr_number or 0,
+                    "pr_url": failed_run.pr_url or "",
+                }
+                worktree_path, branch_name, base_sha, head_sha = (
+                    failed_run.worktree_path,
+                    failed_run.branch_name,
+                    failed_run.base_sha,
+                    target_sha,
+                )
+            else:
+                try:
+                    worktree = create_review_worktree(
+                        self.project_dir,
+                        task.id,
+                        branch_name=metadata["branch_name"],
+                        review_target_sha=target_sha,
+                    )
+                except StateError:
+                    return False
+                worktree_path, branch_name, base_sha, head_sha = (
+                    worktree.path, None, target_sha, target_sha
+                )
+        elif metadata and failed_run.kind in {"repair", "fallback"} and self._is_git_repo():
+            try:
+                worktree = create_repair_worktree(
+                    self.project_dir,
+                    task.id,
+                    branch_name=metadata["branch_name"],
+                    expected_head_sha=metadata["pr_head_sha"],
+                    allow_dirty_reset=True,
+                )
+            except StateError:
+                return False
+            worktree_path, branch_name, base_sha, head_sha = (
+                worktree.path,
+                worktree.branch_name,
+                worktree.base_sha,
+                worktree.base_sha,
+            )
+        elif not worktree_path or not self._safe_task_worktree(task, worktree_path):
+            if not base_sha:
+                return False
+            if self._is_git_repo():
+                try:
+                    worktree = create_fallback_worktree(
+                        self.project_dir, task.id, base_sha=base_sha
+                    )
+                except StateError:
+                    return False
+                worktree_path, branch_name = worktree.path, worktree.branch_name
+        prompt = str(failed_run.result_json.get("prompt") or "")
+        prompt += (
+            f"\n\nRetry this same {failed_run.kind} Run after {failed_run.id}. "
+            "Do not push or ship manually."
+        )
+        dedupe = f"retry:{task.id}:{failed_run.kind}:{failed_run.id}:{failed_run.attempt + 1}"
+        self._create_dispatch_run(
+            conn,
+            task,
+            kind=failed_run.kind,
+            dedupe_key=dedupe,
+            agent=failed_run.agent,
+            model=failed_run.model,
+            parent_run_id=failed_run.id,
+            trigger_run_id=failed_run.id,
+            review_target_sha=target_sha,
+            prompt=prompt,
+            worktree_path=worktree_path,
+            branch_name=branch_name,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            pr_number=metadata["pr_number"] if metadata else failed_run.pr_number,
+            pr_url=metadata["pr_url"] if metadata else failed_run.pr_url,
+            attempt=failed_run.attempt + 1,
+        )
+        return True
+
+    def _create_fallback_run(
+        self, conn, task: tasks_dao.TaskRow, failed_run: runs_dao.RunRow, category: str
+    ) -> bool:
+        metadata = self._pr_metadata(task)
+        worktree_path = None
+        branch_name = None
+        base_sha = failed_run.base_sha
+        head_sha = failed_run.head_sha
+        if metadata and self._is_git_repo():
+            try:
+                worktree = create_repair_worktree(
+                    self.project_dir,
+                    task.id,
+                    branch_name=metadata["branch_name"],
+                    expected_head_sha=metadata["pr_head_sha"],
+                    allow_dirty_reset=True,
+                )
+            except StateError:
+                return False
+            worktree_path, branch_name, base_sha, head_sha = (
+                worktree.path,
+                worktree.branch_name,
+                worktree.base_sha,
+                metadata["pr_head_sha"],
+            )
+        elif metadata:
+            branch_name = metadata["branch_name"]
+            base_sha = metadata["pr_head_sha"]
+            head_sha = metadata["pr_head_sha"]
+        elif failed_run.worktree_path and self._safe_task_worktree(
+            task, failed_run.worktree_path
+        ):
+            worktree_path, branch_name = (
+                failed_run.worktree_path,
+                failed_run.branch_name or reliable_task_branch(task.id),
+            )
+        else:
+            if not base_sha:
+                return False
+            if self._is_git_repo():
+                try:
+                    worktree = create_fallback_worktree(
+                        self.project_dir, task.id, base_sha=base_sha
+                    )
+                except StateError:
+                    return False
+                worktree_path, branch_name = worktree.path, worktree.branch_name
+        prompt = self._fallback_prompt(conn, task, failed_run, category, metadata)
+        self._create_dispatch_run(
+            conn,
+            task,
+            kind="fallback",
+            dedupe_key=f"fallback:{task.id}:{failed_run.id}:codex-cli",
+            agent=CODEX_REVIEW_AGENT,
+            model=self._fallback_model_name(),
+            parent_run_id=failed_run.id,
+            trigger_run_id=failed_run.id,
+            prompt=prompt,
+            worktree_path=worktree_path,
+            branch_name=branch_name,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            pr_number=metadata["pr_number"] if metadata else failed_run.pr_number,
+            pr_url=metadata["pr_url"] if metadata else failed_run.pr_url,
+        )
+        return True
+
+    def _safe_task_worktree(self, task: tasks_dao.TaskRow, path: str) -> bool:
+        if not self._is_git_repo() or not is_managed_worktree_path(self.project_dir, path):
+            return False
+        try:
+            return current_branch_name(path) == reliable_task_branch(task.id) and bool(
+                rev_parse(path, "HEAD")
+            )
+        except StateError:
+            return False
+
+    def _fallback_prompt(self, conn, task, failed_run, category, metadata):
+        scope = "\n".join(f"- {item}" for item in task.acceptance_criteria) or "- none"
+        lines = [
+            "=== RELIABLE ORCHESTRATOR CODEX FALLBACK ===",
+            "Continue the SAME task. Do not make unrelated changes.",
+            "Do not commit, push, ship, merge, enable auto-merge, or close the task.",
+            "System shipping owns commit, push, PR update, and SHA confirmation.",
+            f"Task: {task.id} - {task.title}",
+            "Authoritative acceptance criteria:",
+            scope,
+            f"Failed Claude Run: {failed_run.id}",
+            f"Failure category: {category}",
+            f"Current branch: {failed_run.branch_name or (metadata or {}).get('branch_name') or 'task branch'}",
+            f"Current/base SHA: {failed_run.head_sha or failed_run.base_sha or (metadata or {}).get('pr_head_sha') or 'recorded Run state'}",
+        ]
+        if metadata:
+            lines.extend(
+                [
+                    f"PR: {metadata['pr_url']} (#{metadata['pr_number']})",
+                    f"Current PR head SHA: {metadata['pr_head_sha']}",
+                ]
+            )
+        if failed_run.trigger_run_id:
+            review = runs_dao.get_run(conn, failed_run.trigger_run_id)
+            if review:
+                findings = review.result_json.get("findings", [])
+                lines.extend(
+                    [
+                        f"Rejected review Run: {review.id}",
+                        "Rejected review findings:",
+                        *(f"- {item}" for item in findings),
+                    ]
+                )
+        lines.append(
+            "Run appropriate focused tests and write the structured result JSON to SUPERHARNESS_RUN_RESULT_PATH."
+        )
+        return "\n".join(lines)
+
+    def _fallback_model_name(self) -> str:
+        return str(self._profile().get("codex_implementation_model") or "gpt-5.5")
 
     def _terminalize_inbox(self, conn, run: runs_dao.RunRow, *, failed: bool) -> None:
         if not run.inbox_id:
@@ -419,6 +804,7 @@ class LifecycleOrchestrator:
         head_sha: str | None = None,
         pr_number: int | None = None,
         pr_url: str | None = None,
+        attempt: int = 1,
     ) -> runs_dao.RunRow:
         agent = agent or self._agent_for(task)
         worktree = None
@@ -435,6 +821,7 @@ class LifecycleOrchestrator:
             kind=kind,
             agent=agent,
             model=model,
+            attempt=attempt,
             dedupe_key=dedupe_key,
             parent_run_id=parent_run_id,
             trigger_run_id=trigger_run_id,

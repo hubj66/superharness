@@ -42,6 +42,29 @@ class FailureClassification:
     explain: str  # human-readable, surfaces in dashboard and failed_reason
 
 
+ReliableFailureCategory = Literal[
+    "quota",
+    "session_limit",
+    "agent_crash",
+    "timeout",
+    "hang",
+    "auth",
+    "network",
+    "ship_failure",
+    "invalid_result",
+    "lost_process",
+    "unknown",
+]
+
+
+@dataclass(frozen=True)
+class ReliableFailureClassification:
+    """Durable semantic classification for a reliable-orchestrator Run."""
+
+    category: ReliableFailureCategory
+    explain: str
+
+
 # Order matters: more specific patterns first.
 _PATTERNS: list[tuple[str, Category, bool, str]] = [
     # permanent_block — config / environment errors
@@ -177,4 +200,72 @@ def classify(
         category="unknown",
         retryable=True,
         explain=f"unclassified failure (exit code {launcher_rc})",
+    )
+
+
+_RELIABLE_SESSION_LIMIT = (
+    r"session\s+limit|you(?:'|ve)\s+hit\s+your\s+session|session\s+has\s+been\s+limited"
+)
+_RELIABLE_QUOTA = (
+    r"quota|rate[ -]?limit|too many requests|usage limit|capacity exhausted|"
+    r"resource_exhausted|billing limit|credits? exhausted"
+)
+_RELIABLE_AUTH = (
+    r"authentication|unauthori[sz]ed|invalid api key|api key not valid|"
+    r"permission denied|login required|not logged in|forbidden"
+)
+_RELIABLE_NETWORK = (
+    r"network|connection (?:reset|refused|timed out)|timed out connecting|"
+    r"temporary failure in name resolution|dns|could not resolve host|"
+    r"tls handshake|service unavailable|502|503|504"
+)
+
+
+def classify_reliable(
+    *,
+    launcher_rc: int | None = None,
+    error_text: str = "",
+    log_tail: str = "",
+    timed_out: bool = False,
+    hung: bool = False,
+    invalid_result: bool = False,
+    lost_process: bool = False,
+    ship_failure: bool = False,
+) -> ReliableFailureClassification:
+    """Classify a reliable Run using explicit evidence and narrow signals."""
+    haystack = "\n".join(value for value in (error_text, log_tail) if value)
+    if ship_failure:
+        return ReliableFailureClassification("ship_failure", "system shipping failed")
+    if invalid_result:
+        return ReliableFailureClassification(
+            "invalid_result", "structured Run result was missing or invalid"
+        )
+    if lost_process:
+        return ReliableFailureClassification(
+            "lost_process", "Run process could not be verified after watcher recovery"
+        )
+    if timed_out:
+        return ReliableFailureClassification("timeout", "configured Run timeout expired")
+    if hung:
+        return ReliableFailureClassification("hang", "Run heartbeat/liveness policy expired")
+    if launcher_rc in {139, -11}:
+        return ReliableFailureClassification(
+            "agent_crash", "agent terminated with SIGSEGV (exit 139)"
+        )
+    if launcher_rc is not None and launcher_rc < 0:
+        return ReliableFailureClassification(
+            "agent_crash", f"agent terminated by signal {-launcher_rc}"
+        )
+    if re.search(r"segmentation fault|sigsegv|panic:|traceback", haystack, re.I):
+        return ReliableFailureClassification("agent_crash", "agent crash evidence in output")
+    if re.search(_RELIABLE_SESSION_LIMIT, haystack, re.I):
+        return ReliableFailureClassification("session_limit", "agent session limit reached")
+    if re.search(_RELIABLE_QUOTA, haystack, re.I):
+        return ReliableFailureClassification("quota", "agent quota or rate limit reached")
+    if re.search(_RELIABLE_AUTH, haystack, re.I):
+        return ReliableFailureClassification("auth", "agent authentication failed")
+    if re.search(_RELIABLE_NETWORK, haystack, re.I):
+        return ReliableFailureClassification("network", "network or service failure")
+    return ReliableFailureClassification(
+        "unknown", f"unclassified reliable failure (exit code {launcher_rc})"
     )

@@ -1018,12 +1018,9 @@ def _reliable_run(ctx: DispatchContext) -> bool:
 
 
 def _pid_starttime(pid: int) -> str | None:
-    try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as stat_file:
-            fields = stat_file.read().split()
-        return fields[21] if len(fields) > 21 else None
-    except OSError:
-        return None
+    from superharness.engine.process import process_starttime
+
+    return process_starttime(pid)
 
 
 def _git_snapshot(path: str) -> dict[str, object]:
@@ -1081,13 +1078,35 @@ def _reliable_run_started(ctx: DispatchContext, pid: int | None = None) -> None:
         conn.close()
 
 
+def _reliable_run_heartbeat(ctx: DispatchContext, pid: int | None) -> None:
+    """Refresh the durable observation while the owned child is running."""
+    if not _reliable_run(ctx):
+        return
+    from superharness.engine import runs_dao
+    from superharness.engine.db import get_connection, init_db, transaction
+
+    conn = get_connection(ctx.project_dir)
+    try:
+        init_db(conn)
+        with transaction(conn):
+            runs_dao.touch_run_heartbeat(
+                conn,
+                ctx.run_id or "",
+                now=_now_utc(),
+                pid=pid,
+                pid_starttime=_pid_starttime(pid) if pid else None,
+            )
+    finally:
+        conn.close()
+
+
 def _reliable_run_finished(ctx: DispatchContext) -> None:
     """Persist dispatcher facts and close the linked inbox row."""
     if not _reliable_run(ctx) or ctx.print_only:
         return
     from superharness.engine import inbox_dao, runs_dao
     from superharness.engine.db import get_connection, init_db, transaction
-    from superharness.engine.state_errors import BoundaryError, StateError
+    from superharness.engine.state_errors import BoundaryError
 
     snapshot = _git_snapshot(ctx.exec_project or ctx.project_dir)
     conn = get_connection(ctx.project_dir)
@@ -1133,20 +1152,40 @@ def _reliable_run_finished(ctx: DispatchContext) -> None:
                     failure_detail=str(exc),
                 )
             terminal_success = success and result_valid
+            if terminal_success:
+                terminal_status = "succeeded"
+                terminal_category = None
+                terminal_detail = None
+            else:
+                from superharness.engine.failure_classifier import classify_reliable
+
+                classification = classify_reliable(
+                    launcher_rc=ctx.launcher_rc,
+                    log_tail=_reliable_log_tail(ctx.task_log),
+                    invalid_result=success and not result_valid,
+                    timed_out=ctx.launcher_rc == 124,
+                )
+                terminal_category = classification.category
+                terminal_detail = (
+                    classification.explain
+                    if success
+                    else f"{classification.explain}: exit code {ctx.launcher_rc}"
+                )
+                terminal_status = {
+                    "agent_crash": "crashed",
+                    "lost_process": "crashed",
+                    "timeout": "timed_out",
+                    "hang": "timed_out",
+                    "quota": "quota_blocked",
+                }.get(classification.category, "failed")
             if run.status in {"claimed", "running"}:
                 runs_dao.transition_run(
                     conn,
                     run.id,
-                    to_status="succeeded" if terminal_success else "failed",
+                    to_status=terminal_status,
                     now=_now_utc(),
-                    failure_category=None if terminal_success else "dispatcher_failure",
-                    failure_detail=None
-                    if terminal_success
-                    else (
-                        "invalid structured result"
-                        if success
-                        else f"exit code {ctx.launcher_rc}"
-                    ),
+                    failure_category=terminal_category,
+                    failure_detail=terminal_detail,
                 )
             if run.inbox_id:
                 inbox_dao.update_status(
@@ -1158,9 +1197,9 @@ def _reliable_run_finished(ctx: DispatchContext) -> None:
                     reason=None
                     if terminal_success
                     else (
-                        "invalid structured result"
-                        if success
-                        else f"exit code {ctx.launcher_rc}"
+                        terminal_detail
+                        if not terminal_success
+                        else None
                     ),
                 ) or inbox_dao.update_status(
                     conn,
@@ -1171,13 +1210,23 @@ def _reliable_run_finished(ctx: DispatchContext) -> None:
                     reason=None
                     if terminal_success
                     else (
-                        "invalid structured result"
-                        if success
-                        else f"exit code {ctx.launcher_rc}"
+                        terminal_detail
+                        if not terminal_success
+                        else None
                     ),
                 )
     finally:
         conn.close()
+
+
+def _reliable_log_tail(path: str, lines: int = 50) -> str:
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return "\n".join(handle.read().splitlines()[-lines:])
+    except OSError:
+        return ""
 
 
 def _load_run_result_artifact(ctx: DispatchContext) -> dict[str, object] | None:
@@ -2189,7 +2238,11 @@ def _execute_agent(ctx: DispatchContext) -> None:
                     str(proc.pid),
                 ]
             )
-            ctx.launcher_rc = proc.wait()
+            while proc.poll() is None:
+                if _reliable_run(ctx):
+                    _reliable_run_heartbeat(ctx, proc.pid)
+                _time.sleep(10)
+            ctx.launcher_rc = proc.returncode
         _inbox_cmd(
             [
                 "set_field",
@@ -2359,9 +2412,23 @@ def _resolve_execution_context(ctx: DispatchContext) -> int | None:
     ctx.exec_project = exec_project
 
     # Auto-calculate timeout from task effort if not explicitly set
-    ctx.effective_timeout = ctx.launcher_timeout
-    if ctx.launcher_timeout == 0:
-        ctx.effective_timeout = _get_task_effort_timeout(ctx.project_dir, ctx.item_task)
+    if ctx.run_id:
+        # Reliable Runs are governed by Run heartbeat/reconciliation.  The
+        # legacy effort/default timeout is not a valid liveness signal.  A
+        # hard cap is opt-in and explicit so a quiet but healthy child lives.
+        configured = os.environ.get(
+            "SUPERHARNESS_RELIABLE_HARD_TIMEOUT_SECONDS", ""
+        ).strip()
+        try:
+            ctx.effective_timeout = max(0, int(configured)) if configured else 0
+        except ValueError:
+            ctx.effective_timeout = 0
+    else:
+        ctx.effective_timeout = ctx.launcher_timeout
+        if ctx.launcher_timeout == 0:
+            ctx.effective_timeout = _get_task_effort_timeout(
+                ctx.project_dir, ctx.item_task
+            )
 
     # Worktree isolation: Pi always gets an isolated checkout for autonomous
     # inbox work, including discussions. Other agents retain the existing

@@ -35,6 +35,11 @@ def run_gc(project_dir: str | Path, dry_run: bool = False) -> dict:
         for t in tasks
         if isinstance(t, dict)
     }
+    reliable_task_ids = {
+        str(t.get("id"))
+        for t in tasks
+        if isinstance(t, dict) and t.get("workflow") == "reliable-orchestrator"
+    }
 
     # Read inbox from SQLite
     from superharness.engine.state_reader import get_inbox_items
@@ -52,6 +57,9 @@ def run_gc(project_dir: str | Path, dry_run: bool = False) -> dict:
         status = str(item.get("status", ""))
         task_id = str(item.get("task", item.get("task_id", "")))
         item_id = str(item.get("id", ""))
+
+        if task_id in reliable_task_ids:
+            continue
 
         if status not in GC_ELIGIBLE:
             continue

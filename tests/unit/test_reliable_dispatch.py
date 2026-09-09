@@ -278,8 +278,8 @@ def test_review_exit_zero_without_artifact_fails_run(tmp_path):
         run = runs_dao.get_run(conn, "run-1")
         assert run is not None
         assert run.status == "failed"
-        assert run.failure_category == "dispatcher_failure"
-        assert run.failure_detail == "invalid structured result"
+        assert run.failure_category == "invalid_result"
+        assert run.failure_detail == "structured Run result was missing or invalid"
     finally:
         conn.close()
 
@@ -340,6 +340,6 @@ def test_review_artifact_with_wrong_run_id_fails_run(tmp_path):
         run = runs_dao.get_run(conn, "run-1")
         assert run is not None
         assert run.status == "failed"
-        assert run.failure_category == "dispatcher_failure"
+        assert run.failure_category == "invalid_result"
     finally:
         conn.close()

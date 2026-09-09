@@ -672,8 +672,7 @@ def _auto_archive_stale_tasks(project_dir: str) -> int:
     archived = 0
 
     for task in all_tasks:
-        if task.status in ("done", "archived", "stopped", "failed"):
-            continue
+        if _is_reliable_task(task) or task.status in ("done", "archived", "stopped", "failed"): continue
         # Check if task has been in this state long enough
         ts_str = (
             task.report_ready_at
@@ -4372,7 +4371,7 @@ def _auto_delete_stale_inbox(project_dir: str) -> int:
             ).strftime("%Y-%m-%dT%H:%M:%SZ")
             # Delete stale items where the last update was before the cutoff
             cursor = conn.execute(
-                "DELETE FROM inbox WHERE status='stale' AND (failed_at IS NULL OR failed_at < ?)",
+                "DELETE FROM inbox WHERE status='stale' AND (failed_at IS NULL OR failed_at < ?) AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.id=inbox.task_id AND tasks.workflow='reliable-orchestrator')",
                 (cutoff,),
             )
             deleted = cursor.rowcount or 0

@@ -27,6 +27,7 @@ LEGAL_TRANSITIONS = {
         "pending_user_approval",
         "stopped",
         "failed",
+        "blocked",
         "waiting_input",
     ],
     "pending_user_approval": ["in_progress", "stopped"],

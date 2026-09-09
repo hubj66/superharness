@@ -81,6 +81,44 @@ def create_managed_worktree(
     return ManagedWorktree(path=path, branch_name=branch, base_sha=base_sha)
 
 
+def create_fallback_worktree(
+    project_dir: str,
+    task_id: str,
+    *,
+    base_sha: str,
+    remote: str = DEFAULT_REMOTE,
+) -> ManagedWorktree:
+    """Create a task worktree from an explicitly recorded implementation base.
+
+    An existing healthy task worktree is intentionally reused so a fallback
+    can preserve safe partial edits.  A missing worktree is created from the
+    Run's recorded base, never from the caller checkout's implicit HEAD.
+    """
+    if not base_sha:
+        raise StateError("fallback worktree requires an explicit base SHA")
+    branch = reliable_task_branch(task_id)
+    root = managed_worktree_root(project_dir)
+    path = os.path.join(root, branch.replace("/", "-"))
+    os.makedirs(root, exist_ok=True)
+    if os.path.isdir(path):
+        current_branch = current_branch_name(path)
+        if current_branch != branch:
+            raise StateError(
+                f"Fallback worktree {path!r} is on {current_branch!r}, not {branch!r}"
+            )
+        rev_parse(path, "HEAD")
+        return ManagedWorktree(path=path, branch_name=branch, base_sha=base_sha)
+    if ref_exists(project_dir, f"refs/heads/{branch}"):
+        _run_git(project_dir, "branch", "--force", branch, base_sha)
+    else:
+        _run_git(project_dir, "branch", branch, base_sha)
+    result = _run_git(project_dir, "worktree", "add", path, branch, check=False)
+    if result.returncode != 0:
+        raise StateError(result.stderr.strip() or "git fallback worktree add failed")
+    _link_superharness_state(project_dir, path)
+    return ManagedWorktree(path=path, branch_name=branch, base_sha=base_sha)
+
+
 def create_review_worktree(
     project_dir: str,
     task_id: str,
@@ -131,6 +169,7 @@ def create_repair_worktree(
     branch_name: str,
     expected_head_sha: str,
     remote: str = DEFAULT_REMOTE,
+    allow_dirty_reset: bool = False,
 ) -> ManagedWorktree:
     """Create or reset the managed task branch worktree from the current PR head."""
     remote_sha = resolve_remote_branch_sha(
@@ -150,7 +189,7 @@ def create_repair_worktree(
             raise StateError(
                 f"Managed worktree {path!r} is on {current_branch!r}, not {branch_name!r}"
             )
-        if not _is_clean(path):
+        if not _is_clean(path) and not allow_dirty_reset:
             raise StateError(f"Repair worktree {path!r} has uncommitted changes")
         _run_git(path, "reset", "--hard", remote_sha)
         return ManagedWorktree(path=path, branch_name=branch_name, base_sha=remote_sha)

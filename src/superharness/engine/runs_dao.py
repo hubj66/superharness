@@ -32,7 +32,7 @@ MUTATING_RUN_KINDS = frozenset({"plan", "implement", "repair", "fallback", "ship
 
 RUN_TRANSITIONS: dict[str, frozenset[str]] = {
     "queued": frozenset({"claimed", "cancelled"}),
-    "claimed": frozenset({"running", "cancelled", "failed"}),
+    "claimed": frozenset({"queued", "running", "cancelled", "failed"}),
     "running": frozenset(
         {"succeeded", "failed", "crashed", "timed_out", "quota_blocked", "cancelled"}
     ),
@@ -222,6 +222,19 @@ def list_unconsumed_finished_runs(
     return [_row_to_run(row) for row in conn.execute(query, params).fetchall()]
 
 
+def list_active_runs(
+    conn: sqlite3.Connection, *, task_id: str | None = None
+) -> list[RunRow]:
+    """Return durable active executions for restart reconciliation."""
+    query = "SELECT * FROM runs WHERE status IN ('queued','claimed','running')"
+    params: list[Any] = []
+    if task_id is not None:
+        query += " AND task_id=?"
+        params.append(task_id)
+    query += " ORDER BY created_at ASC, id ASC"
+    return [_row_to_run(row) for row in conn.execute(query, params).fetchall()]
+
+
 def transition_run(
     conn: sqlite3.Connection,
     id: str,
@@ -297,6 +310,33 @@ def record_run_execution(
     if updated is None:
         raise StateError(f"Run '{run_id}' disappeared while recording execution")
     return updated
+
+
+def touch_run_heartbeat(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    now: str,
+    pid: int | None = None,
+    pid_starttime: str | None = None,
+) -> RunRow:
+    """Record an observation of an active Run without changing lifecycle."""
+    run = get_run(conn, run_id)
+    if run is None:
+        raise StateError(f"Run '{run_id}' not found")
+    if run.status not in ACTIVE_RUN_STATUSES:
+        return run
+    assignments = ["heartbeat_at=?"]
+    params: list[Any] = [now]
+    if pid is not None:
+        assignments.append("pid=?")
+        params.append(pid)
+    if pid_starttime is not None:
+        assignments.append("pid_starttime=?")
+        params.append(pid_starttime)
+    params.append(run_id)
+    conn.execute(f"UPDATE runs SET {', '.join(assignments)} WHERE id=?", params)
+    return get_run(conn, run_id) or run
 
 
 def record_run_result(

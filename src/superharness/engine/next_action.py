@@ -85,6 +85,7 @@ _MAPPING: dict[str, tuple[Optional[str], list[str], str]] = {
             "pending_user_approval",
             "stopped",
             "failed",
+            "blocked",
             "waiting_input",
         ],
         "agent is working; wait for report_ready or pending_user_approval",
