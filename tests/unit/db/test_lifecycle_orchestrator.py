@@ -126,7 +126,7 @@ def test_plan_success_without_auto_approval_stops_at_plan_proposed(tmp_path):
         conn.close()
 
 
-def test_implementation_success_is_consumed_but_does_not_ship_or_close(tmp_path):
+def test_implementation_success_is_consumed_and_creates_ship_without_close(tmp_path):
     project, conn = _project(tmp_path)
     try:
         _task(conn, "t1")
@@ -145,7 +145,8 @@ def test_implementation_success_is_consumed_but_does_not_ship_or_close(tmp_path)
         run = runs_dao.get_run(conn, implementation.id)
         assert task is not None and task.status == "in_progress"
         assert run is not None and run.orchestrator_consumed_at is not None
-        assert len(runs_dao.list_runs_for_task(conn, "t1", kind="ship")) == 0
+        assert len(runs_dao.list_runs_for_task(conn, "t1", kind="ship")) == 1
+        assert len(runs_dao.list_runs_for_task(conn, "t1", kind="review")) == 0
     finally:
         conn.close()
 

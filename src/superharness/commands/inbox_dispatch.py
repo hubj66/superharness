@@ -1038,7 +1038,9 @@ def _git_snapshot(path: str) -> dict[str, object]:
             return None
 
     head = run("rev-parse", "HEAD")
-    branch = run("symbolic-ref", "--short", "HEAD") or run("rev-parse", "--short", "HEAD")
+    branch = run("symbolic-ref", "--short", "HEAD") or run(
+        "rev-parse", "--short", "HEAD"
+    )
     dirty_output = run("status", "--porcelain", "--untracked-files=normal")
     return {
         "branch_name": branch,
@@ -1094,7 +1096,9 @@ def _reliable_run_finished(ctx: DispatchContext) -> None:
                 raise RuntimeError(f"run {ctx.run_id} disappeared before completion")
             success = ctx.launcher_rc == 0
             if success and run.status == "claimed":
-                runs_dao.transition_run(conn, run.id, to_status="running", now=_now_utc())
+                runs_dao.transition_run(
+                    conn, run.id, to_status="running", now=_now_utc()
+                )
                 run = runs_dao.get_run(conn, run.id) or run
             result_snapshot = dict(snapshot)
             if success:
@@ -1726,7 +1730,10 @@ def _handle_failure(ctx: DispatchContext) -> int:
 
     if ctx.prelaunch_failure_reason:
         fail_reason = ctx.prelaunch_failure_reason
-        print(f"Pre-launch isolation failure for {ctx.item_id}: {fail_reason}", file=sys.stderr)
+        print(
+            f"Pre-launch isolation failure for {ctx.item_id}: {fail_reason}",
+            file=sys.stderr,
+        )
     elif ctx.launcher_rc == 124:
         fail_reason = f"launcher timed out after {ctx.effective_timeout}s"
         print(
@@ -2227,7 +2234,9 @@ def _prepare_execution(ctx: DispatchContext) -> None:
         spawn_env["SUPERHARNESS_CONFIRM_NON_INTERACTIVE"] = "YES"
     # When dispatching from a git worktree, preserve the original project path
     # so delegate reads state from the correct XDG database.
-    if ctx.worktree_dir and ctx.project_dir:
+    if ctx.project_dir and (
+        ctx.worktree_dir or (ctx.run_id and ctx.exec_project != ctx.project_dir)
+    ):
         spawn_env["SUPERHARNESS_STATE_PROJECT"] = ctx.project_dir
     ctx.spawn_env = spawn_env
 
@@ -2264,7 +2273,8 @@ def _resolve_execution_context(ctx: DispatchContext) -> int | None:
             os.path.join(ctx.item_project, ".superharness")
         )
         if (
-            proj_harness_real == item_harness_real
+            not ctx.run_id
+            and proj_harness_real == item_harness_real
             and ctx.project_dir != ctx.item_project
             and os.path.isdir(proj_harness_real)
         ):
@@ -2285,11 +2295,12 @@ def _resolve_execution_context(ctx: DispatchContext) -> int | None:
         "discuss-"
     )
     automated_dispatch = ctx.non_interactive and not ctx.print_only
-    pi_requires_worktree = automated_dispatch and ctx.item_to == "pi"
+    pi_requires_worktree = automated_dispatch and ctx.item_to == "pi" and not ctx.run_id
     dirty_requires_worktree = (
         automated_dispatch
         and not ctx.is_discussion
         and not pi_requires_worktree
+        and not ctx.run_id
         and _has_dirty_worktree(ctx.exec_project)
     )
     if pi_requires_worktree:
@@ -2319,9 +2330,7 @@ def _resolve_execution_context(ctx: DispatchContext) -> int | None:
                 if pi_requires_worktree
                 else "main worktree is dirty"
             )
-            print(
-                f"Dispatching in worktree: {ctx.worktree_dir} ({reason})"
-            )
+            print(f"Dispatching in worktree: {ctx.worktree_dir} ({reason})")
             ctx.exec_project = ctx.worktree_dir
             # Record worktree path on task for dashboard visibility
             try:

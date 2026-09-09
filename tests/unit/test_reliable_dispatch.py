@@ -7,6 +7,7 @@ from superharness.commands.inbox_dispatch import (
     _prepare_execution,
     _reliable_run_finished,
     _reliable_run_started,
+    _resolve_execution_context,
     _sqlite_claim_next,
 )
 from superharness.engine import inbox_dao, runs_dao
@@ -91,5 +92,36 @@ def test_dispatch_passes_run_id_to_agent_and_records_completion(tmp_path):
         assert run is not None and run.status == "succeeded"
         assert run.result_json["run_id"] == "run-1"
         assert inbox_dao.get(conn, "inbox-1").status == "done"
+    finally:
+        conn.close()
+
+
+def test_linked_run_preserves_orchestrator_worktree_path(tmp_path):
+    project, conn = _project(tmp_path)
+    worktree = tmp_path / "superharness-worktrees" / "wt"
+    worktree.mkdir(parents=True)
+    (worktree / ".superharness").symlink_to(project / ".superharness")
+    try:
+        ctx = DispatchContext(
+            project_dir=str(project),
+            inbox_file=str(project / ".superharness" / "inbox.yaml"),
+            contract_file=str(project / ".superharness" / "contract.yaml"),
+            print_only=False,
+            non_interactive=True,
+            codex_bypass=False,
+            launcher_timeout=0,
+            script_dir=str(project),
+            sqlite_primary=True,
+            item_id="inbox-1",
+            item_task="t1",
+            item_to="claude-code",
+            item_project=str(worktree),
+            run_id="run-1",
+            item={"plan_only": False},
+        )
+        assert _resolve_execution_context(ctx) is None
+        assert ctx.exec_project == str(worktree)
+        _prepare_execution(ctx)
+        assert ctx.spawn_env["SUPERHARNESS_STATE_PROJECT"] == str(project)
     finally:
         conn.close()

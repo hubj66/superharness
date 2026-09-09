@@ -23,6 +23,7 @@ LEGAL_TRANSITIONS = {
     "plan_approved": ["in_progress", "plan_proposed"],
     "in_progress": [
         "report_ready",
+        "pr_open",
         "pending_user_approval",
         "stopped",
         "failed",

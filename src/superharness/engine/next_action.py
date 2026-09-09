@@ -79,7 +79,14 @@ _MAPPING: dict[str, tuple[Optional[str], list[str], str]] = {
     ),
     "in_progress": (
         None,
-        ["report_ready", "pending_user_approval", "stopped", "failed", "waiting_input"],
+        [
+            "report_ready",
+            "pr_open",
+            "pending_user_approval",
+            "stopped",
+            "failed",
+            "waiting_input",
+        ],
         "agent is working; wait for report_ready or pending_user_approval",
     ),
     "pending_user_approval": (

@@ -339,6 +339,50 @@ def record_run_result(
     return updated
 
 
+def record_ship_outcome(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    branch_name: str | None = None,
+    worktree_path: str | None = None,
+    base_sha: str | None = None,
+    head_sha: str | None = None,
+    remote_head_sha: str | None = None,
+    pr_number: int | None = None,
+    pr_url: str | None = None,
+    failure_category: str | None = None,
+    failure_detail: str | None = None,
+    result_json: dict[str, Any] | None = None,
+) -> RunRow:
+    """Persist system shipper facts without deciding task lifecycle."""
+    if get_run(conn, run_id) is None:
+        raise StateError(f"Run '{run_id}' not found")
+    updates: dict[str, Any] = {
+        "branch_name": branch_name,
+        "worktree_path": worktree_path,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "remote_head_sha": remote_head_sha,
+        "pr_number": pr_number,
+        "pr_url": pr_url,
+        "failure_category": failure_category,
+        "failure_detail": failure_detail,
+    }
+    if result_json is not None:
+        updates["result_json"] = json.dumps(result_json)
+    safe_updates = {key: value for key, value in updates.items() if value is not None}
+    if safe_updates:
+        assignments = ", ".join(f"{key}=?" for key in safe_updates)
+        conn.execute(
+            f"UPDATE runs SET {assignments} WHERE id=?",
+            [*safe_updates.values(), run_id],
+        )
+    updated = get_run(conn, run_id)
+    if updated is None:
+        raise StateError(f"Run '{run_id}' disappeared while recording ship outcome")
+    return updated
+
+
 def mark_run_consumed(conn: sqlite3.Connection, run_id: str, *, now: str) -> bool:
     cursor = conn.execute(
         """
@@ -379,12 +423,12 @@ def link_inbox(conn: sqlite3.Connection, *, run_id: str, inbox_id: str) -> RunRo
             raise StateError(f"Run '{run_id}' not found")
         return _row_to_run(row)
     except sqlite3.Error as e:
-        raise StateError(f"Failed to link run '{run_id}' to inbox '{inbox_id}': {e}") from e
+        raise StateError(
+            f"Failed to link run '{run_id}' to inbox '{inbox_id}': {e}"
+        ) from e
 
 
-def _validate_run_core(
-    *, kind: str, status: str, agent: str, dedupe_key: str
-) -> None:
+def _validate_run_core(*, kind: str, status: str, agent: str, dedupe_key: str) -> None:
     _validate_kind(kind)
     _validate_status(status)
     if not agent:
