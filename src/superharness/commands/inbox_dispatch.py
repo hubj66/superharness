@@ -1196,11 +1196,7 @@ def _reliable_run_finished(ctx: DispatchContext) -> None:
                     now=_now_utc(),
                     reason=None
                     if terminal_success
-                    else (
-                        terminal_detail
-                        if not terminal_success
-                        else None
-                    ),
+                    else (terminal_detail if not terminal_success else None),
                 ) or inbox_dao.update_status(
                     conn,
                     run.inbox_id,
@@ -1209,11 +1205,7 @@ def _reliable_run_finished(ctx: DispatchContext) -> None:
                     now=_now_utc(),
                     reason=None
                     if terminal_success
-                    else (
-                        terminal_detail
-                        if not terminal_success
-                        else None
-                    ),
+                    else (terminal_detail if not terminal_success else None),
                 )
     finally:
         conn.close()
@@ -2381,6 +2373,7 @@ def _prepare_execution(ctx: DispatchContext) -> None:
         ctx.wrapped_args = [
             "script",
             "-q",
+            "-e",
             "-f",
             "-c",
             shlex.join(launch_args),

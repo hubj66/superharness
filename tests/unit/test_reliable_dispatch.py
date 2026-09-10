@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import platform
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from superharness.commands.inbox_dispatch import (
     DispatchContext,
@@ -92,6 +96,120 @@ def test_dispatch_passes_run_id_to_agent_and_records_completion(tmp_path):
         assert run is not None and run.status == "succeeded"
         assert run.result_json["run_id"] == "run-1"
         assert inbox_dao.get(conn, "inbox-1").status == "done"
+    finally:
+        conn.close()
+
+
+def test_linux_pty_wrapper_propagates_child_exit_code(tmp_path, monkeypatch):
+    project, conn = _project(tmp_path)
+    try:
+        monkeypatch.delenv("SUPERHARNESS_NO_PTY_WRAP", raising=False)
+        monkeypatch.setattr(platform, "system", lambda: "Linux")
+        _sqlite_claim_next(str(project), "claude-code", NOW)
+        ctx = DispatchContext(
+            project_dir=str(project),
+            inbox_file=str(project / ".superharness" / "inbox.yaml"),
+            contract_file=str(project / ".superharness" / "contract.yaml"),
+            print_only=False,
+            non_interactive=True,
+            codex_bypass=False,
+            launcher_timeout=0,
+            script_dir=str(project),
+            sqlite_primary=True,
+            item_id="inbox-1",
+            item_task="t1",
+            item_to="claude-code",
+            item_project=str(project),
+            exec_project=str(project),
+            run_id="run-1",
+            item={"plan_only": False},
+        )
+        _prepare_execution(ctx)
+        assert ctx.wrapped_args[:3] == ["script", "-q", "-e"]
+    finally:
+        conn.close()
+
+
+def test_darwin_pty_wrapper_keeps_bsd_script_invocation(tmp_path, monkeypatch):
+    project, conn = _project(tmp_path)
+    try:
+        monkeypatch.delenv("SUPERHARNESS_NO_PTY_WRAP", raising=False)
+        monkeypatch.setattr(platform, "system", lambda: "Darwin")
+        _sqlite_claim_next(str(project), "claude-code", NOW)
+        ctx = DispatchContext(
+            project_dir=str(project),
+            inbox_file=str(project / ".superharness" / "inbox.yaml"),
+            contract_file=str(project / ".superharness" / "contract.yaml"),
+            print_only=False,
+            non_interactive=True,
+            codex_bypass=False,
+            launcher_timeout=0,
+            script_dir=str(project),
+            sqlite_primary=True,
+            item_id="inbox-1",
+            item_task="t1",
+            item_to="claude-code",
+            item_project=str(project),
+            exec_project=str(project),
+            run_id="run-1",
+            item={"plan_only": False},
+        )
+        _prepare_execution(ctx)
+        assert ctx.wrapped_args[:3] == ["script", "-q", "-F"]
+        assert "-e" not in ctx.wrapped_args[:4]
+    finally:
+        conn.close()
+
+
+def test_util_linux_script_return_flag_propagates_distinctive_exit_code(tmp_path):
+    log_path = tmp_path / "script.log"
+    result = subprocess.run(
+        ["script", "-q", "-e", "-f", "-c", "sh -c 'exit 7'", str(log_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 127 and "No such file" in result.stderr:
+        pytest.skip("script command unavailable")
+    assert result.returncode == 7
+
+
+@pytest.mark.parametrize("exit_code", [1, 7])
+def test_nonzero_delegate_exit_cannot_succeed_reliable_run(tmp_path, exit_code):
+    project, conn = _project(tmp_path)
+    try:
+        _sqlite_claim_next(str(project), "claude-code", NOW)
+        ctx = DispatchContext(
+            project_dir=str(project),
+            inbox_file=str(project / ".superharness" / "inbox.yaml"),
+            contract_file=str(project / ".superharness" / "contract.yaml"),
+            print_only=False,
+            non_interactive=True,
+            codex_bypass=False,
+            launcher_timeout=0,
+            script_dir=str(project),
+            sqlite_primary=True,
+            item_id="inbox-1",
+            item_task="t1",
+            item_to="claude-code",
+            item_project=str(project),
+            exec_project=str(project),
+            run_id="run-1",
+            item={"plan_only": False},
+        )
+        _prepare_execution(ctx)
+        _reliable_run_started(ctx, pid=None)
+        ctx.launcher_rc = exit_code
+        _reliable_run_finished(ctx)
+
+        run = runs_dao.get_run(conn, "run-1")
+        assert run is not None
+        assert run.status != "succeeded"
+        assert run.status == "failed"
+        assert run.result_json["exit_code"] == exit_code
+        assert run.result_json["completion_status"] == "failed"
+        assert inbox_dao.get(conn, "inbox-1").status == "failed"
+        assert runs_dao.list_runs_for_task(conn, "t1", kind="ship") == []
     finally:
         conn.close()
 

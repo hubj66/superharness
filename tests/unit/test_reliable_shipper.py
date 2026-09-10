@@ -193,6 +193,61 @@ def test_managed_worktree_uses_deterministic_branch_and_explicit_origin_base(tmp
     assert _run(worktree, "symbolic-ref", "--short", "HEAD") == branch
 
 
+def test_managed_worktree_replaces_tracked_superharness_with_live_state(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SUPERHARNESS_WORKTREE_ROOT", str(tmp_path / "managed"))
+    project, _origin, _upstream = _repo(tmp_path)
+    source_state = project / ".superharness"
+    (source_state / "profile.yaml").write_text("workflow: tracked\n", encoding="utf-8")
+    _run(project, "add", ".superharness/profile.yaml")
+    _run(project, "commit", "-m", "track superharness config")
+    _run(project, "push", "origin", "main")
+
+    handoffs = source_state / "handoffs"
+    handoffs.mkdir()
+    (handoffs / "runtime.yaml").write_text("live: true\n", encoding="utf-8")
+
+    wt = create_managed_worktree(str(project), "t1")
+    worktree = Path(wt.path)
+    dst_state = worktree / ".superharness"
+
+    assert dst_state.is_symlink()
+    assert dst_state.resolve() == source_state.resolve()
+    assert (dst_state / "handoffs" / "runtime.yaml").read_text(
+        encoding="utf-8"
+    ) == "live: true\n"
+    assert source_state.is_dir()
+    assert (source_state / "handoffs" / "runtime.yaml").exists()
+    assert (worktree / "README.md").is_file()
+    assert not (worktree / "README.md").is_symlink()
+
+    reused = create_managed_worktree(str(project), "t1")
+    assert reused.path == wt.path
+    assert dst_state.is_symlink()
+    assert dst_state.resolve() == source_state.resolve()
+
+    wrong_state = tmp_path / "wrong-state"
+    wrong_state.mkdir()
+    dst_state.unlink()
+    dst_state.symlink_to(wrong_state)
+    reused_again = create_managed_worktree(str(project), "t1")
+    assert reused_again.path == wt.path
+    assert dst_state.is_symlink()
+    assert dst_state.resolve() == source_state.resolve()
+
+    (worktree / "README.md").write_text("changed\n", encoding="utf-8")
+    (dst_state / "handoffs" / "new-runtime.yaml").write_text(
+        "runtime\n", encoding="utf-8"
+    )
+    shipper = SystemShipper(str(project), runner=FakeGh())
+    staged = shipper._stage_intended_diff(str(worktree))
+    assert staged.ok
+    cached = _run(worktree, "diff", "--cached", "--name-only")
+    assert "README.md" in cached.splitlines()
+    assert not any(path.startswith(".superharness") for path in cached.splitlines())
+
+
 def test_review_worktree_is_detached_at_exact_remote_pr_sha(tmp_path):
     project, worktree, branch, base_sha = _shipping_fixture(tmp_path)
     (worktree / "README.md").write_text("changed\n", encoding="utf-8")

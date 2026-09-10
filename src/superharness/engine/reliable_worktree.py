@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -70,6 +71,7 @@ def create_managed_worktree(
             raise StateError(
                 f"Managed worktree {path!r} is on {current_branch!r}, not {branch!r}"
             )
+        _link_superharness_state(project_dir, path)
         return ManagedWorktree(path=path, branch_name=branch, base_sha=base_sha)
 
     if not ref_exists(project_dir, f"refs/heads/{branch}"):
@@ -107,6 +109,7 @@ def create_fallback_worktree(
                 f"Fallback worktree {path!r} is on {current_branch!r}, not {branch!r}"
             )
         rev_parse(path, "HEAD")
+        _link_superharness_state(project_dir, path)
         return ManagedWorktree(path=path, branch_name=branch, base_sha=base_sha)
     if ref_exists(project_dir, f"refs/heads/{branch}"):
         _run_git(project_dir, "branch", "--force", branch, base_sha)
@@ -146,6 +149,7 @@ def create_review_worktree(
             raise StateError(
                 f"Review worktree {path!r} is at {head}, not {review_target_sha}"
             )
+        _link_superharness_state(project_dir, path)
         return ManagedWorktree(path=path, branch_name=None, base_sha=review_target_sha)
     result = _run_git(
         project_dir,
@@ -192,6 +196,7 @@ def create_repair_worktree(
         if not _is_clean(path) and not allow_dirty_reset:
             raise StateError(f"Repair worktree {path!r} has uncommitted changes")
         _run_git(path, "reset", "--hard", remote_sha)
+        _link_superharness_state(project_dir, path)
         return ManagedWorktree(path=path, branch_name=branch_name, base_sha=remote_sha)
 
     if ref_exists(project_dir, f"refs/heads/{branch_name}"):
@@ -251,10 +256,36 @@ def _is_control_plane_entry(entry: str) -> bool:
 
 
 def _link_superharness_state(project_dir: str, worktree_path: str) -> None:
-    src = os.path.join(project_dir, ".superharness")
+    src = os.path.realpath(os.path.join(project_dir, ".superharness"))
+    if not os.path.isdir(src):
+        return
+
+    worktree_real = os.path.realpath(worktree_path)
+    if not is_managed_worktree_path(project_dir, worktree_real):
+        raise StateError(
+            f"Refusing to rewrite .superharness outside managed worktree: {worktree_path!r}"
+        )
+
     dst = os.path.join(worktree_path, ".superharness")
-    if os.path.isdir(src) and not os.path.lexists(dst):
-        os.symlink(src, dst)
+    dst_parent_real = os.path.realpath(os.path.dirname(dst))
+    if dst_parent_real != worktree_real:
+        raise StateError(f"Unsafe .superharness destination: {dst!r}")
+
+    if os.path.islink(dst):
+        if os.path.realpath(dst) == src:
+            return
+        os.unlink(dst)
+    elif os.path.lexists(dst):
+        dst_abs = os.path.abspath(dst)
+        worktree_abs = os.path.abspath(worktree_path)
+        if dst_abs != os.path.join(worktree_abs, ".superharness"):
+            raise StateError(f"Unsafe .superharness destination: {dst!r}")
+        if os.path.isdir(dst):
+            shutil.rmtree(dst)
+        else:
+            os.unlink(dst)
+
+    os.symlink(src, dst)
 
 
 def _run_git(
