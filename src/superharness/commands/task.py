@@ -617,6 +617,14 @@ def status_update(
         if task_row is None:
             _abort(f"task '{task_id}' not found")
 
+        from superharness.engine.reliable_orchestrator_gate import (
+            reliable_run_lifecycle_violation,
+        )
+
+        violation = reliable_run_lifecycle_violation(conn, task_row)
+        if violation:
+            _abort(violation, 2)
+
         owner = str(task_row.owner or "")
         if not owner:
             _abort(f"task '{task_id}' has no owner set")

@@ -739,6 +739,120 @@ def test_delegate_reliable_run_model_mismatch_fails_closed(tmp_path):
     assert "uses model 'claude-sonnet-4-6', not 'gpt-5-codex'" in r.stderr
 
 
+@pytest.mark.parametrize(
+    ("run_kind", "status", "agent", "extra_args"),
+    [
+        ("plan", "todo", "claude-code", ["--plan-only"]),
+        ("implement", "in_progress", "claude-code", []),
+        ("fallback", "in_progress", "codex-cli", []),
+        ("repair", "in_progress", "claude-code", []),
+        ("review", "review_requested", "codex-cli", ["--for-review"]),
+    ],
+)
+def test_reliable_prompt_does_not_delegate_lifecycle_or_shipping(
+    tmp_path, run_kind, status, agent, extra_args
+):
+    project, run_id = _setup_reliable_run_project(
+        tmp_path, status=status, run_kind=run_kind, agent=agent
+    )
+    result = _run_reliable_delegate(project, run_id, agent=agent, extra_args=extra_args)
+    assert result.returncode == 0, result.stderr
+    assert "continue reliable-orchestrator Run" in result.stdout
+    assert "Do not run `shux task status`" in result.stdout
+    assert "Do not commit, push" in result.stdout
+    assert "shux contract` to update task status" not in result.stdout
+    assert "Run `shux task status" not in result.stdout
+    assert "ALLOW_PUSH=1 /ship commit" not in result.stdout
+
+
+def test_reliable_review_prompt_is_read_only_and_sha_bound(tmp_path):
+    project, run_id = _setup_reliable_run_project(
+        tmp_path, status="review_requested", run_kind="review", agent="codex-cli"
+    )
+    result = _run_reliable_delegate(
+        project, run_id, agent="codex-cli", extra_args=["--for-review"]
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Review only" in result.stdout
+    assert "sha-review" in result.stdout
+    assert "Do not modify any file or task" in result.stdout
+
+
+@pytest.mark.parametrize("requested_status", ["plan_proposed", "done"])
+def test_reliable_run_cannot_mutate_task_status_from_agent_process(
+    tmp_path, requested_status
+):
+    project, run_id = _setup_reliable_run_project(
+        tmp_path, status="todo", run_kind="plan"
+    )
+    from superharness.commands.task import status_update
+    from superharness.engine.db import managed_connection
+
+    with (
+        patch.dict(os.environ, {"SUPERHARNESS_RUN_ID": run_id}),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        status_update(
+            str(project),
+            "gh-1-r2",
+            requested_status,
+            "claude-code",
+            summary="agent attempted lifecycle mutation",
+        )
+    assert exc_info.value.code == 2
+    with managed_connection(str(project)) as conn:
+        task = conn.execute(
+            "SELECT status FROM tasks WHERE id=?", ("gh-1-r2",)
+        ).fetchone()
+    assert task[0] == "todo"
+
+
+def test_reliable_run_task_status_cli_is_lifecycle_guarded(tmp_path):
+    project, run_id = _setup_reliable_run_project(
+        tmp_path, status="todo", run_kind="plan"
+    )
+    env = os.environ.copy()
+    env["SUPERHARNESS_RUN_ID"] = run_id
+    env["PYTHONPATH"] = str(REPO_ROOT / "src")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "superharness.commands.task",
+            "status",
+            "--project",
+            str(project),
+            "--id",
+            "gh-1-r2",
+            "--status",
+            "done",
+            "--actor",
+            "claude-code",
+            "--summary",
+            "agent attempted close",
+        ],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2, result.stderr
+    assert "LifecycleOrchestrator owns task lifecycle" in result.stderr
+
+
+def test_reliable_run_cannot_close_task_from_agent_process(tmp_path):
+    project, run_id = _setup_reliable_run_project(
+        tmp_path, status="review_passed", run_kind="review", agent="codex-cli"
+    )
+    from superharness.commands.close import close_task
+
+    with patch.dict(os.environ, {"SUPERHARNESS_RUN_ID": run_id}):
+        result = close_task(
+            str(project), "gh-1-r2", "codex-cli", "agent attempted close", force=True
+        )
+    assert result == 2
+
 
 
 

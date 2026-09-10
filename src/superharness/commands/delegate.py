@@ -161,6 +161,64 @@ def _build_task_execution_prompt(
     )
 
 
+def _build_reliable_task_execution_prompt(
+    *,
+    target: str,
+    task_id: str,
+    run_id: str,
+    run_kind: str,
+    review_target_sha: str | None,
+    acceptance_criteria: str,
+    context_hint: str,
+    user_instructions: str,
+    auto_directive: str,
+) -> str:
+    """Build the agent contract for one durable reliable-orchestrator Run.
+
+    Reliable agents report facts for the Run; they never own task lifecycle or
+    repository shipping. Keep this separate from the legacy prompt because
+    legacy handoff/contract instructions remain supported for other workflows.
+    """
+    common = (
+        "continue reliable-orchestrator Run\n"
+        f"Run id: {run_id}. Task: {task_id}. Run kind: {run_kind}.\n"
+        "SQLite Run state is authoritative. Report execution facts for this Run; "
+        "do not mutate task lifecycle state.\n"
+        "Do not run `shux task status` or `shux contract` to change status. "
+        "Do not create or update ledger/handoff lifecycle records.\n"
+        "Do not commit, push, create or update a PR, merge, enable auto-merge, "
+        "invoke /ship, or close the task.\n"
+    )
+    if run_kind == "plan":
+        role = (
+            "Planning only: inspect the task and repository as needed, then provide "
+            "a concise implementation plan and acceptance/test approach. Do not "
+            "modify source, tests, or configuration. The orchestrator will consume "
+            "your successful Run result and advance the task.\n"
+        )
+    elif run_kind == "review":
+        role = (
+            "Review only: inspect the exact immutable review checkout and report a "
+            "structured LGTM or REJECTED verdict. Do not modify any file or task.\n"
+            f"The required review target SHA is {review_target_sha or 'missing'}.\n"
+        )
+    else:
+        role = (
+            "Mutation execution: edit only the source and tests needed for the task, "
+            "run the relevant tests, and leave the intended changes in this managed "
+            "worktree for the system shipper. Do not perform lifecycle or shipping "
+            "actions yourself.\n"
+        )
+    return (
+        common
+        + role
+        + acceptance_criteria
+        + context_hint
+        + user_instructions
+        + auto_directive
+    )
+
+
 # Effort → max budget USD (per-task caps to prevent runaway spend)
 EFFORT_BUDGET_MAP = {
     "low": 0.50,
@@ -454,6 +512,18 @@ def _reliable_run_dispatch_statuses(
     if not statuses:
         return None, f"reliable Run kind '{run.kind}' is not agent-dispatchable", None
     return statuses, None, run.model
+
+
+def _reliable_run_for_prompt(project_dir: str):
+    """Return the durable Run bound to this agent process, if any."""
+    run_id = os.environ.get("SUPERHARNESS_RUN_ID", "").strip()
+    if not run_id:
+        return None
+    from superharness.engine import runs_dao
+    from superharness.engine.db import managed_connection
+
+    with managed_connection(project_dir) as conn:
+        return runs_dao.get_run(conn, run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -908,9 +978,6 @@ def delegate(
 
     if not is_project_initialized(project_dir):
         _abort(f"Missing project state at {project_dir}. Run 'shux init' first.")
-    if not os.path.isdir(handoff_dir):
-        _abort(f"Missing handoff directory: {handoff_dir}")
-
     contract_id = _get_contract_id(project_dir)
 
     # Discussion-round detection
@@ -948,6 +1015,12 @@ def delegate(
         print(f"blocked: task '{task_id}' not found", file=sys.stderr)
         return EXIT_PERMANENT_BLOCK
 
+    _workflow = _infer_workflow(task_id, task_obj)
+    # Reliable Runs use SQLite Run/task context and do not require legacy
+    # handoff files. All other dispatches retain the legacy precondition.
+    if not os.path.isdir(handoff_dir) and _workflow != "reliable-orchestrator":
+        _abort(f"Missing handoff directory: {handoff_dir}")
+
     # Gate 4: minimum content — plan-only dispatch requires acceptance criteria
     # or definition of done. Empty tasks produce empty plans, wasting an agent cycle.
     if plan_only and task_obj:
@@ -983,7 +1056,6 @@ def delegate(
     _task_status = task_obj.get(
         "status", ""
     )  # task_obj is guaranteed non-None past Gate 3b
-    _workflow = _infer_workflow(task_id, task_obj)
     _DISPATCH_TERMINAL_STATUSES = {"done", "failed", "stopped"}
     # Auto-route: todo+implementation → plan-only (soft-route, not a permanent block)
     if _workflow == "implementation" and _task_status == "todo" and not plan_only:
@@ -1123,6 +1195,9 @@ def delegate(
     resolved_effort = ""
     model_source = "fallback"
     reliable_run_bound = bool(_reliable_run_model)
+    reliable_run = _reliable_run_for_prompt(project_dir) if reliable_run_bound else None
+    if reliable_run_bound and reliable_run is None:
+        _abort("reliable Run disappeared before model resolution", EXIT_PERMANENT_BLOCK)
     if _reliable_run_model:
         resolved_model = _reliable_run_model
         model_source = "reliable-run"
@@ -1347,8 +1422,14 @@ def delegate(
             "Do not ask for confirmation or approval. "
             "Proceed and apply all changes immediately."
         )
+    if reliable_run is not None and reliable_run.kind in {"plan", "review"}:
+        auto_directive = (
+            "\nThis is an automated read-only run. Do not ask for confirmation. "
+            "Return the required structured result without changing source or "
+            "task state."
+        )
 
-    if plan_only:
+    if plan_only and not reliable_run_bound:
         # Plan-only dispatch: agent must write a plan handoff and stop. No
         # implementation code should be touched on this turn. The owner will
         # review the plan and re-dispatch (without --plan-only) to execute.
@@ -1379,7 +1460,7 @@ def delegate(
     _ship_on_complete = ship_on_complete or str(
         _get_task_field(project_dir, task_id, "ship_on_complete") or ""
     ).lower() in ("true", "1", "yes")
-    if _ship_on_complete:
+    if _ship_on_complete and not reliable_run_bound:
         auto_directive += (
             "\n\n=== SHIP-ON-COMPLETE ===\n"
             "This task has ship_on_complete: true.\n"
@@ -1451,16 +1532,30 @@ def delegate(
         # Build context hint to reduce cold-start exploration time
         context_hint = build_context_hint(project_dir, task_obj or {})
 
-        prompt = _build_task_execution_prompt(
-            target=target,
-            task_id=task_id,
-            contract_id=contract_id,
-            latest_handoff=bool(latest_handoff),
-            acceptance_criteria=acceptance_criteria,
-            context_hint=context_hint,
-            user_instructions=user_instructions,
-            auto_directive=auto_directive,
-        )
+        if reliable_run_bound:
+            assert reliable_run is not None
+            prompt = _build_reliable_task_execution_prompt(
+                target=target,
+                task_id=task_id,
+                run_id=reliable_run.id,
+                run_kind=reliable_run.kind,
+                review_target_sha=reliable_run.review_target_sha,
+                acceptance_criteria=acceptance_criteria,
+                context_hint=context_hint,
+                user_instructions=user_instructions,
+                auto_directive=auto_directive,
+            )
+        else:
+            prompt = _build_task_execution_prompt(
+                target=target,
+                task_id=task_id,
+                contract_id=contract_id,
+                latest_handoff=bool(latest_handoff),
+                acceptance_criteria=acceptance_criteria,
+                context_hint=context_hint,
+                user_instructions=user_instructions,
+                auto_directive=auto_directive,
+            )
         components.append(("task_instructions", prompt))
 
         # Enrich prompt with vault context

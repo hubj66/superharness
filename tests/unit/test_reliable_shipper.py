@@ -248,6 +248,28 @@ def test_managed_worktree_replaces_tracked_superharness_with_live_state(
     assert not any(path.startswith(".superharness") for path in cached.splitlines())
 
 
+def test_shipper_normalizes_unpushed_agent_commit(tmp_path):
+    project, worktree, branch, base_sha = _shipping_fixture(tmp_path)
+    (worktree / "README.md").write_text("agent implementation\n", encoding="utf-8")
+    _run(worktree, "add", "README.md")
+    _run(worktree, "commit", "-m", "agent ignored the commit contract")
+    agent_commit = _run(worktree, "rev-parse", "HEAD")
+
+    conn, task, source, ship = _db(project, worktree, branch, base_sha)
+    outcome = SystemShipper(str(project), runner=FakeGh()).ship(
+        ship_run=ship, source_run=source, task=task
+    )
+    assert outcome.ok, outcome.failure_detail
+    assert outcome.head_sha != agent_commit
+    assert outcome.head_sha
+    assert f"Superharness-Run: {source.id}" in _run(
+        worktree, "log", "-1", "--pretty=%B"
+    )
+    assert f"Superharness-Task: {task.id}" in _run(worktree, "log", "-1", "--pretty=%B")
+    assert f"Agent: {source.agent}" in _run(worktree, "log", "-1", "--pretty=%B")
+    conn.close()
+
+
 def test_review_worktree_is_detached_at_exact_remote_pr_sha(tmp_path):
     project, worktree, branch, base_sha = _shipping_fixture(tmp_path)
     (worktree / "README.md").write_text("changed\n", encoding="utf-8")

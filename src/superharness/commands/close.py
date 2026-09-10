@@ -105,6 +105,15 @@ def close_task(
     try:
         init_db(conn)
         task_row = tasks_dao.get(conn, task_id)
+        if task_row is not None:
+            from superharness.engine.reliable_orchestrator_gate import (
+                reliable_run_lifecycle_violation,
+            )
+
+            violation = reliable_run_lifecycle_violation(conn, task_row)
+            if violation:
+                print(violation, file=sys.stderr)
+                return 2
     finally:
         conn.close()
 

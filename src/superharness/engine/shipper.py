@@ -34,6 +34,7 @@ SHIP_FAILURES = frozenset(
         "pr_create_failed",
         "remote_head_mismatch",
         "invalid_remote",
+        "unsafe_agent_commit",
     }
 )
 
@@ -91,7 +92,14 @@ class SystemShipper:
 
         worktree = os.path.realpath(source_run.worktree_path or "")
         branch = source_run.branch_name or ""
-        pre_ship_head = source_run.head_sha or rev_parse(worktree, "HEAD")
+        pre_ship_head = (
+            source_run.base_sha or source_run.head_sha or rev_parse(worktree, "HEAD")
+        )
+        normalization = self._normalize_agent_commit(
+            worktree, branch, expected_base=pre_ship_head, source_run=source_run
+        )
+        if normalization is not None:
+            return normalization
         commit_sha = self._existing_commit_sha(worktree, source_run.id, pre_ship_head)
         if commit_sha is None:
             stage_result = self._stage_intended_diff(worktree)
@@ -132,6 +140,64 @@ class SystemShipper:
             pr_url=pr.pr_url,
             worktree_path=worktree,
         )
+
+    def _normalize_agent_commit(
+        self,
+        worktree: str,
+        branch: str,
+        *,
+        expected_base: str,
+        source_run: runs_dao.RunRow,
+    ) -> ShipOutcome | None:
+        """Recover an unpushed agent commit into the shipper's staging area.
+
+        Reliable mutators are instructed to leave edits uncommitted, but a
+        client may ignore that contract. On a managed task branch, an
+        unpushed descendant of the recorded base can be safely made into
+        working-tree changes with a mixed reset; the system then creates the
+        authoritative trailer-bearing commit. Anything whose ownership or
+        remote ancestry is uncertain fails closed without touching the files.
+        """
+        current = rev_parse(worktree, "HEAD")
+        if current == expected_base or self._commit_has_trailer(
+            worktree, source_run.id
+        ):
+            return None
+        if not branch or branch in {self.base_branch, "main", "master"}:
+            return self._fail(
+                "unsafe_agent_commit", "agent advanced an unmanaged/default branch"
+            )
+
+        ancestor = self._git(
+            worktree, "merge-base", "--is-ancestor", expected_base, current
+        )
+        if ancestor.returncode != 0:
+            return self._fail(
+                "unsafe_agent_commit",
+                "agent HEAD is not a descendant of the recorded Run base",
+            )
+
+        remote = self._git(worktree, "ls-remote", self.remote, f"refs/heads/{branch}")
+        if remote.returncode != 0:
+            return self._fail(
+                "unsafe_agent_commit",
+                "could not verify whether agent commits were pushed",
+            )
+        remote_sha = (remote.stdout.split() or [""])[0]
+        if remote_sha and remote_sha != expected_base:
+            return self._fail(
+                "unsafe_agent_commit",
+                f"remote branch {branch} is {remote_sha}, not recorded base "
+                f"{expected_base}",
+            )
+
+        reset = self._git(worktree, "reset", "--mixed", expected_base)
+        if reset.returncode != 0:
+            return self._fail(
+                "unsafe_agent_commit",
+                reset.stderr.strip() or "could not normalize agent commit",
+            )
+        return None
 
     def _preflight(
         self,
