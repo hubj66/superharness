@@ -34,6 +34,7 @@ VALID_WORKFLOWS = {
     "review",
     "approval",
     "note",
+    "reliable-orchestrator",
 }
 TOKEN_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 
@@ -1021,7 +1022,11 @@ def main(argv: list[str] | None = None) -> None:
     p_create.add_argument(
         "--workflow",
         default="implementation",
-        help="Optional workflow template: implementation, quick, discussion, review, approval, note (default: implementation)",
+        help=(
+            "Optional workflow template: implementation, quick, discussion, "
+            "review, approval, note, reliable-orchestrator "
+            "(default: implementation)"
+        ),
     )
     p_create.add_argument(
         "--development-method",
