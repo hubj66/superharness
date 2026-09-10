@@ -38,6 +38,16 @@ ALL_STATUSES: list[str] = [
 ]
 
 TERMINAL_STATUSES = frozenset({"done", "failed", "stopped"})
+RELIABLE_ORCHESTRATOR_WORKFLOW = "reliable-orchestrator"
+
+_RELIABLE_RUN_KIND_DISPATCH_STATUSES: dict[str, frozenset[str]] = {
+    "plan": frozenset({"todo", "plan_proposed"}),
+    "implement": frozenset({"plan_approved", "in_progress"}),
+    "fallback": frozenset({"in_progress"}),
+    "review": frozenset({"review_requested"}),
+    "repair": frozenset({"review_failed", "in_progress"}),
+    "ship": frozenset(),
+}
 
 _DISC_ROUND_RE = re.compile(r"^(discuss-[^/]+)/round-(\d+)$")
 
@@ -273,6 +283,14 @@ def allowed_statuses_for_workflow(
         return allowed
     if workflow == "approval":
         return {"pending_user_approval"}
+    if workflow == RELIABLE_ORCHESTRATOR_WORKFLOW:
+        if for_review:
+            return set(_RELIABLE_RUN_KIND_DISPATCH_STATUSES["review"])
+        return set(
+            _RELIABLE_RUN_KIND_DISPATCH_STATUSES["implement"]
+            | _RELIABLE_RUN_KIND_DISPATCH_STATUSES["fallback"]
+            | _RELIABLE_RUN_KIND_DISPATCH_STATUSES["repair"]
+        )
     return {"plan_approved", "in_progress"}
 
 
@@ -292,7 +310,15 @@ def plan_only_allowed_statuses(workflow: str) -> set[str]:
             "review_failed",
             "in_progress",
         }
+    if workflow == RELIABLE_ORCHESTRATOR_WORKFLOW:
+        return set(_RELIABLE_RUN_KIND_DISPATCH_STATUSES["plan"])
     return allowed_statuses_for_workflow(workflow)
+
+
+def reliable_dispatch_statuses_for_run_kind(kind: str) -> set[str]:
+    """Return task statuses where a durable reliable Run kind may dispatch."""
+
+    return set(_RELIABLE_RUN_KIND_DISPATCH_STATUSES.get(kind, frozenset()))
 
 
 # ---------------------------------------------------------------------------

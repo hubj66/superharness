@@ -7,6 +7,7 @@ from superharness.engine.next_action import (
     allowed_statuses_for_workflow,
     infer_workflow,
     plan_only_allowed_statuses,
+    reliable_dispatch_statuses_for_run_kind,
 )
 
 
@@ -78,6 +79,19 @@ def test_allowed_unknown_workflow_defaults_to_plan_approved_in_progress():
     }
 
 
+def test_allowed_reliable_orchestrator_worker_statuses_are_narrow():
+    allowed = allowed_statuses_for_workflow("reliable-orchestrator", for_review=False)
+    assert allowed == {"plan_approved", "in_progress", "review_failed"}
+    assert "todo" not in allowed
+    assert "review_requested" not in allowed
+
+
+def test_allowed_reliable_orchestrator_review_status():
+    assert allowed_statuses_for_workflow("reliable-orchestrator", for_review=True) == {
+        "review_requested"
+    }
+
+
 # ── plan_only_allowed_statuses ───────────────────────────────────────────────
 
 
@@ -97,6 +111,32 @@ def test_plan_only_noop_for_non_implementation_workflows():
     assert plan_only_allowed_statuses("note") == allowed_statuses_for_workflow(
         "note", for_review=False
     )
+
+
+def test_plan_only_reliable_orchestrator_matches_plan_run_statuses():
+    assert plan_only_allowed_statuses("reliable-orchestrator") == {
+        "todo",
+        "plan_proposed",
+    }
+
+
+def test_reliable_dispatch_statuses_are_keyed_by_run_kind():
+    assert reliable_dispatch_statuses_for_run_kind("plan") == {
+        "todo",
+        "plan_proposed",
+    }
+    assert reliable_dispatch_statuses_for_run_kind("implement") == {
+        "plan_approved",
+        "in_progress",
+    }
+    assert reliable_dispatch_statuses_for_run_kind("fallback") == {"in_progress"}
+    assert reliable_dispatch_statuses_for_run_kind("review") == {"review_requested"}
+    assert reliable_dispatch_statuses_for_run_kind("repair") == {
+        "review_failed",
+        "in_progress",
+    }
+    assert reliable_dispatch_statuses_for_run_kind("ship") == set()
+    assert reliable_dispatch_statuses_for_run_kind("unknown") == set()
 
 
 # ── pr_open status ──────────────────────────────────────────────────────────

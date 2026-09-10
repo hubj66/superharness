@@ -366,6 +366,72 @@ from superharness.engine.next_action import (  # noqa: E402
 EXIT_PERMANENT_BLOCK = 2
 
 
+def _reliable_run_dispatch_statuses(
+    project_dir: str,
+    *,
+    task_id: str,
+    target: str,
+    plan_only: bool,
+    for_review: bool,
+) -> tuple[set[str] | None, str | None]:
+    """Validate a reliable-orchestrator dispatch against its durable Run.
+
+    Reliable lifecycle dispatch is owned by LifecycleOrchestrator. When a
+    dispatcher launches a linked inbox item it supplies SUPERHARNESS_RUN_ID; use
+    that Run's kind as the authority for which task statuses are legal.
+    """
+
+    run_id = os.environ.get("SUPERHARNESS_RUN_ID", "").strip()
+    if not run_id:
+        return None, None
+
+    from superharness.engine import runs_dao
+    from superharness.engine.db import managed_connection
+
+    try:
+        with managed_connection(project_dir) as conn:
+            run = runs_dao.get_run(conn, run_id)
+    except (OSError, sqlite3.Error, StateError) as exc:
+        return None, f"could not read reliable Run '{run_id}': {exc}"
+
+    if run is None:
+        return None, f"reliable Run '{run_id}' not found"
+    if run.task_id != task_id:
+        return None, (
+            f"reliable Run '{run_id}' belongs to task '{run.task_id}', not '{task_id}'"
+        )
+    if run.agent != target:
+        return None, (
+            f"reliable Run '{run_id}' targets agent '{run.agent}', not '{target}'"
+        )
+
+    if run.kind == "plan":
+        if not plan_only or for_review:
+            return None, f"reliable plan Run '{run_id}' must dispatch with --plan-only"
+    elif run.kind == "review":
+        if plan_only or not for_review:
+            return (
+                None,
+                f"reliable review Run '{run_id}' must dispatch with --for-review",
+            )
+    elif run.kind in {"implement", "fallback", "repair"}:
+        if plan_only or for_review:
+            return None, (
+                f"reliable {run.kind} Run '{run_id}' must dispatch as worker execution"
+            )
+    elif run.kind == "ship":
+        return None, f"reliable ship Run '{run_id}' is system-owned and not delegable"
+    else:
+        return None, f"reliable Run '{run_id}' has unsupported kind '{run.kind}'"
+
+    from superharness.engine.next_action import reliable_dispatch_statuses_for_run_kind
+
+    statuses = reliable_dispatch_statuses_for_run_kind(run.kind)
+    if not statuses:
+        return None, f"reliable Run kind '{run.kind}' is not agent-dispatchable"
+    return statuses, None
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator helpers
 # ---------------------------------------------------------------------------
@@ -903,12 +969,49 @@ def delegate(
             "(status: todo, workflow: implementation) — agent will propose a plan.",
             file=sys.stderr,
         )
-    if plan_only:
-        _DISPATCH_ALLOWED_STATUSES = _plan_only_allowed_statuses(_workflow)
-    else:
-        _DISPATCH_ALLOWED_STATUSES = _allowed_statuses_for_workflow(
-            _workflow, for_review=for_review
+    _reliable_run_gate_error = None
+    if _workflow == "reliable-orchestrator":
+        (
+            _DISPATCH_ALLOWED_STATUSES,
+            _reliable_run_gate_error,
+        ) = _reliable_run_dispatch_statuses(
+            project_dir,
+            task_id=task_id,
+            target=target,
+            plan_only=plan_only,
+            for_review=for_review,
         )
+        if _DISPATCH_ALLOWED_STATUSES is None and _reliable_run_gate_error is None:
+            _reliable_run_gate_error = (
+                "reliable-orchestrator dispatch requires SUPERHARNESS_RUN_ID"
+            )
+    else:
+        _DISPATCH_ALLOWED_STATUSES = None
+    if _reliable_run_gate_error:
+        print(
+            f"blocked: {_reliable_run_gate_error}",
+            file=sys.stderr,
+        )
+        try:
+            from superharness.engine.ledger_dao import decision_log
+
+            decision_log(
+                project_dir,
+                "gate_block",
+                task_id=task_id,
+                agent=target,
+                reason=_reliable_run_gate_error,
+            )
+        except (OSError, sqlite3.Error, StateError) as e:
+            logger.warning("delegate.py unexpected error: %s", e, exc_info=True)
+        return EXIT_PERMANENT_BLOCK
+    if _DISPATCH_ALLOWED_STATUSES is None:
+        if plan_only:
+            _DISPATCH_ALLOWED_STATUSES = _plan_only_allowed_statuses(_workflow)
+        else:
+            _DISPATCH_ALLOWED_STATUSES = _allowed_statuses_for_workflow(
+                _workflow, for_review=for_review
+            )
     if (
         _task_status not in _DISPATCH_ALLOWED_STATUSES
         and _task_status not in _DISPATCH_TERMINAL_STATUSES

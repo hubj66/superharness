@@ -450,6 +450,194 @@ def _setup_project_todo(tmp_path: Path) -> Path:
     return project
 
 
+def _setup_reliable_run_project(
+    tmp_path: Path,
+    *,
+    status: str,
+    run_kind: str,
+    agent: str = "claude-code",
+) -> tuple[Path, str]:
+    project = tmp_path / f"proj_reliable_{run_kind}_{status}"
+    project.mkdir()
+    harness = project / ".superharness"
+    (harness / "handoffs").mkdir(parents=True, exist_ok=True)
+
+    from superharness.engine import runs_dao
+    from superharness.engine.db import get_connection, init_db
+
+    conn = get_connection(str(project))
+    try:
+        init_db(conn)
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                id, title, owner, status, effort, project_path, context,
+                workflow, version, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "gh-1-r2",
+                "Add multiply function",
+                agent,
+                status,
+                "low",
+                str(project),
+                "Add multiply(a, b) and tests for positives, negatives, and zero.",
+                "reliable-orchestrator",
+                1,
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        run_id = f"run-{run_kind}-{status.replace('_', '-')}"
+        runs_dao.create_run(
+            conn,
+            id=run_id,
+            task_id="gh-1-r2",
+            kind=run_kind,
+            agent=agent,
+            model="claude-sonnet-4-6" if agent == "claude-code" else "gpt-5.5",
+            dedupe_key=f"{run_kind}:gh-1-r2:test",
+            review_target_sha="sha-review" if run_kind == "review" else None,
+            now="2026-01-01T00:00:00Z",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return project, run_id
+
+
+def _run_reliable_delegate(
+    project: Path,
+    run_id: str | None,
+    *,
+    agent: str = "claude-code",
+    extra_args: list[str] | None = None,
+):
+    env = {"SUPERHARNESS_RUN_ID": run_id} if run_id else None
+    return _run_delegate_py(
+        project,
+        args=[
+            "--to",
+            agent,
+            "--project",
+            str(project),
+            "--task",
+            "gh-1-r2",
+            "--print-only",
+            "--no-auto-model",
+            *(extra_args or []),
+        ],
+        env=env,
+    )
+
+
+def test_delegate_public_cli_allows_reliable_plan_run_at_todo(tmp_path):
+    project, run_id = _setup_reliable_run_project(
+        tmp_path, status="todo", run_kind="plan"
+    )
+    r = _run_reliable_delegate(project, run_id, extra_args=["--plan-only"])
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "Generated prompt:" in r.stdout
+
+
+def test_delegate_allows_reliable_plan_retry_at_plan_proposed(tmp_path):
+    project, run_id = _setup_reliable_run_project(
+        tmp_path, status="plan_proposed", run_kind="plan"
+    )
+    r = _run_reliable_delegate(project, run_id, extra_args=["--plan-only"])
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+
+
+def test_delegate_allows_reliable_implementation_run_at_in_progress(tmp_path):
+    project, run_id = _setup_reliable_run_project(
+        tmp_path, status="in_progress", run_kind="implement"
+    )
+    r = _run_reliable_delegate(project, run_id)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+
+
+def test_delegate_allows_reliable_review_run_at_review_requested(tmp_path):
+    project, run_id = _setup_reliable_run_project(
+        tmp_path, status="review_requested", run_kind="review", agent="codex-cli"
+    )
+    r = _run_reliable_delegate(
+        project, run_id, agent="codex-cli", extra_args=["--for-review"]
+    )
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+
+
+def test_delegate_allows_reliable_repair_run_at_in_progress(tmp_path):
+    project, run_id = _setup_reliable_run_project(
+        tmp_path, status="in_progress", run_kind="repair"
+    )
+    r = _run_reliable_delegate(project, run_id)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+
+
+def test_delegate_blocks_manual_reliable_dispatch_without_run_id(tmp_path):
+    project, _run_id = _setup_reliable_run_project(
+        tmp_path, status="todo", run_kind="plan"
+    )
+    r = _run_reliable_delegate(project, None, extra_args=["--plan-only"])
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert "requires SUPERHARNESS_RUN_ID" in r.stderr
+
+
+def test_delegate_blocks_reliable_run_kind_launch_mode_mismatch(tmp_path):
+    project, run_id = _setup_reliable_run_project(
+        tmp_path, status="todo", run_kind="plan"
+    )
+    r = _run_reliable_delegate(project, run_id)
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert "must dispatch with --plan-only" in r.stderr
+
+
+def test_delegate_blocks_reliable_run_task_mismatch(tmp_path):
+    project, run_id = _setup_reliable_run_project(
+        tmp_path, status="todo", run_kind="plan"
+    )
+    from superharness.engine.db import managed_connection
+
+    with managed_connection(str(project)) as conn:
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                id, title, owner, status, effort, project_path, context,
+                workflow, version, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "gh-other",
+                "Other",
+                "claude-code",
+                "todo",
+                "low",
+                str(project),
+                "Other reliable task.",
+                "reliable-orchestrator",
+                1,
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+
+    r = _run_delegate_py(
+        project,
+        args=[
+            "--to",
+            "claude-code",
+            "--project",
+            str(project),
+            "--task",
+            "gh-other",
+            "--print-only",
+            "--no-auto-model",
+            "--plan-only",
+        ],
+        env={"SUPERHARNESS_RUN_ID": run_id},
+    )
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert "belongs to task 'gh-1-r2'" in r.stderr
+
 
 
 
