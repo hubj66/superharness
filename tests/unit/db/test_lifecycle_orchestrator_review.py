@@ -236,8 +236,7 @@ def test_repair_success_ships_and_new_pr_head_gets_fresh_review(tmp_path):
         _complete_repair(conn, repair)
         orch.tick("t1")
         task = tasks_dao.get(conn, "t1")
-        assert task is not None and task.status == "pr_open"
-        orch.tick("t1")
+        assert task is not None and task.status == "review_requested"
         reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
         assert [run.review_target_sha for run in reviews] == ["sha-a", "sha-b"]
         assert len(runs_dao.list_runs_for_task(conn, "t1", kind="ship")) == 1

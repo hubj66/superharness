@@ -36,7 +36,7 @@ def test_owner_release_is_scoped(db_conn):
     assert orchestrator_lease.get(db_conn) is None
 
 
-def test_v40_to_v41_migration_is_additive_and_idempotent():
+def test_v40_to_current_migration_is_additive_and_idempotent():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute(
@@ -45,8 +45,11 @@ def test_v40_to_v41_migration_is_additive_and_idempotent():
     conn.execute("PRAGMA user_version=40")
     init_db(conn)
     init_db(conn)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 41
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 42
     assert conn.execute(
         "SELECT name FROM sqlite_master WHERE name='orchestrator_lease'"
+    ).fetchone()
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE name='agent_availability'"
     ).fetchone()
     conn.close()

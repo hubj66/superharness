@@ -17,7 +17,7 @@ from superharness.utils.paths import (
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = 41
+CURRENT_SCHEMA_VERSION = 42
 
 # Journal modes SQLite accepts; used to validate the SUPERHARNESS_JOURNAL_MODE
 # override before it is interpolated into a PRAGMA (guards against injection/typos).
@@ -1980,7 +1980,9 @@ def _migration_v40(conn: sqlite3.Connection) -> None:
         WHERE inbox_id IS NOT NULL
         """
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_task_status ON runs(task_id, status)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_runs_task_status ON runs(task_id, status)"
+    )
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_runs_unconsumed_finished
@@ -2014,6 +2016,33 @@ def _migration_v41(conn: sqlite3.Connection) -> None:
             expires_at    TEXT NOT NULL
         )
         """
+    )
+
+
+def _migration_v42(conn: sqlite3.Connection) -> None:
+    """Add durable agent availability evidence for reliable orchestration."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_availability (
+            agent                 TEXT PRIMARY KEY,
+            state                 TEXT NOT NULL CHECK (
+                state IN ('available', 'temporarily_blocked', 'auth_blocked', 'unknown')
+            ),
+            reason                TEXT,
+            blocked_until         TEXT,
+            retry_after_at        TEXT,
+            last_success_at       TEXT,
+            last_failure_at       TEXT,
+            last_failure_category TEXT,
+            source_run_id         TEXT,
+            updated_at            TEXT NOT NULL,
+            FOREIGN KEY (source_run_id) REFERENCES runs(id) ON DELETE SET NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_availability_state "
+        "ON agent_availability(state, retry_after_at, blocked_until)"
     )
 
 
@@ -2059,4 +2088,5 @@ _MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migration_v39,
     _migration_v40,
     _migration_v41,
+    _migration_v42,
 ]

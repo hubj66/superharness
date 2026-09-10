@@ -1,7 +1,7 @@
 """The feature-gated lifecycle owner for reliable-orchestrator tasks.
 
-Phase 4 adds SHA-bound Codex review and Claude repair loops.  It does not
-fall back between implementation agents or merge work.
+Phase 6 adds availability-aware agent selection and independent review while
+still leaving merge decisions manual.
 """
 
 from __future__ import annotations
@@ -12,13 +12,26 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
-from superharness.engine import inbox_dao, runs_dao, tasks_dao
+from superharness.engine import agent_availability, inbox_dao, runs_dao, tasks_dao
+from superharness.engine.agent_selector import (
+    CLAUDE_AGENT,
+    CODEX_AGENT,
+    DEFAULT_CODEX_MODEL,
+    AgentAssignment,
+    AgentSelector,
+)
 from superharness.engine.db import get_connection, init_db, transaction
+from superharness.engine.failure_classifier import (
+    ReliableFailureCategory,
+    ReliableFailureClassification,
+    classify_reliable,
+)
 from superharness.engine.next_action import validate_status_transition
+from superharness.engine.process import probe_process
 from superharness.engine.reliable_orchestrator_gate import (
     is_reliable_orchestrated_task,
 )
@@ -32,19 +45,26 @@ from superharness.engine.reliable_worktree import (
     reliable_task_branch,
     rev_parse,
 )
-from superharness.engine.failure_classifier import (
-    ReliableFailureClassification,
-    classify_reliable,
-)
-from superharness.engine.process import probe_process
 from superharness.engine.run_results import validate_result_for_run
 from superharness.engine.shipper import SYSTEM_AGENT, SystemShipper
 from superharness.engine.state_errors import BoundaryError, StateError
 
 _ACTIVE_INBOX_STATUSES = ("pending", "launched", "running", "paused")
-CODEX_REVIEW_AGENT = "codex-cli"
-DEFAULT_CODEX_REVIEW_MODEL = "gpt-5.5"
 RELIABLE_HEARTBEAT_GRACE_SECONDS = 15 * 60
+AGENT_FAILURE_CATEGORIES = frozenset(
+    {
+        "quota",
+        "session_limit",
+        "agent_crash",
+        "timeout",
+        "hang",
+        "auth",
+        "network",
+        "invalid_result",
+        "lost_process",
+        "unknown",
+    }
+)
 
 
 def _now_utc() -> str:
@@ -79,6 +99,7 @@ class LifecycleOrchestrator:
         self._auto_approve = auto_approve_plans
         self._review_agent = review_agent
         self._review_model = review_model
+        self._profile_cache: dict[str, Any] | None = None
         self._shipper_factory = shipper_factory or (
             lambda project: SystemShipper(project)
         )
@@ -123,8 +144,16 @@ class LifecycleOrchestrator:
                             conn, task.id, kind="plan"
                         )
                         if not existing:
+                            assignment = self._select_mutator(conn, task)
+                            if assignment is None:
+                                continue
                             self._create_dispatch_run(
-                                conn, task, kind="plan", dedupe_key=f"plan:{task.id}"
+                                conn,
+                                task,
+                                kind="plan",
+                                dedupe_key=f"plan:{task.id}",
+                                agent=assignment.agent,
+                                model=assignment.model,
                             )
                             result = TickResult(
                                 inspected=result.inspected,
@@ -154,11 +183,16 @@ class LifecycleOrchestrator:
                                 conn, task.id, kind="plan"
                             )
                             plan_token = plan_runs[-1].id if plan_runs else "manual"
+                            assignment = self._select_mutator(conn, task)
+                            if assignment is None:
+                                continue
                             self._create_dispatch_run(
                                 conn,
                                 task,
                                 kind="implement",
                                 dedupe_key=f"implement:{task.id}:{plan_token}",
+                                agent=assignment.agent,
+                                model=assignment.model,
                                 parent_run_id=plan_runs[-1].id if plan_runs else None,
                             )
                             self._transition_task(conn, task, "in_progress")
@@ -197,11 +231,20 @@ class LifecycleOrchestrator:
                         consumed, transitions, _created = self._consume_finished(
                             conn, task
                         )
+                        task = tasks_dao.get(conn, run.task_id)
+                        review_created = 0
+                        review_transition = 0
+                        if task is not None and is_reliable_orchestrated_task(task):
+                            review_created, review_transition = self._ensure_review_run(
+                                conn, task
+                            )
                         result = TickResult(
                             inspected=result.inspected,
-                            runs_created=result.runs_created,
+                            runs_created=result.runs_created + review_created,
                             results_consumed=result.results_consumed + consumed,
-                            transitions=result.transitions + transitions,
+                            transitions=(
+                                result.transitions + transitions + review_transition
+                            ),
                         )
             return result
         finally:
@@ -213,7 +256,12 @@ class LifecycleOrchestrator:
         created = 0
         for run in runs_dao.list_unconsumed_finished_runs(conn, task_id=task.id):
             if run.kind not in {
-                "plan", "implement", "repair", "fallback", "ship", "review"
+                "plan",
+                "implement",
+                "repair",
+                "fallback",
+                "ship",
+                "review",
             }:
                 continue
             if run.status == "succeeded":
@@ -249,6 +297,8 @@ class LifecycleOrchestrator:
                         runs_dao.mark_run_consumed(conn, run.id, now=self._now())
                         consumed += 1
                     continue
+                if run.kind != "ship":
+                    self._record_agent_success(conn, run)
                 if run.kind == "plan" and task.status == "todo":
                     self._transition_task(conn, task, "plan_proposed")
                     transitions += 1
@@ -273,6 +323,7 @@ class LifecycleOrchestrator:
                     self._transition_task(conn, task, "pr_open")
                     transitions += 1
                 elif run.kind == "review":
+                    self._terminalize_inbox(conn, run, failed=False)
                     review_transitions, review_created = self._consume_review_result(
                         conn, task, run, result
                     )
@@ -282,6 +333,7 @@ class LifecycleOrchestrator:
             if run.status != "succeeded":
                 if self._run_owner_may_be_live(run):
                     continue
+                self._terminalize_inbox(conn, run, failed=True)
                 failure_created, failure_transitions = self._route_failed_run(
                     conn, task, run
                 )
@@ -321,7 +373,9 @@ class LifecycleOrchestrator:
                         or "dispatch claimed run but process identity was not persisted",
                     )
                     continue
-                runs_dao.transition_run(conn, run.id, to_status="queued", now=self._now())
+                runs_dao.transition_run(
+                    conn, run.id, to_status="queued", now=self._now()
+                )
                 continue
             if run.status != "running":
                 continue
@@ -347,7 +401,9 @@ class LifecycleOrchestrator:
                     )
                     continue
             if result is not None and result.completion_status == "completed":
-                runs_dao.transition_run(conn, run.id, to_status="succeeded", now=self._now())
+                runs_dao.transition_run(
+                    conn, run.id, to_status="succeeded", now=self._now()
+                )
                 continue
 
             process_state = probe_process(run.pid, run.pid_starttime)
@@ -361,7 +417,11 @@ class LifecycleOrchestrator:
                 )
                 continue
             if process_state in {"dead", "reused"} or self._heartbeat_expired(run):
-                category = "lost_process" if process_state in {"reused", "unknown"} else "agent_crash"
+                category = (
+                    "lost_process"
+                    if process_state in {"reused", "unknown"}
+                    else "agent_crash"
+                )
                 runs_dao.transition_run(
                     conn,
                     run.id,
@@ -376,52 +436,86 @@ class LifecycleOrchestrator:
         if not stamp:
             return False
         try:
-            current = datetime.fromisoformat(self._now().replace("Z", "+00:00"))
-            previous = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
-            return (current - previous).total_seconds() > RELIABLE_HEARTBEAT_GRACE_SECONDS
+            current = datetime.fromisoformat(self._now())
+            previous = datetime.fromisoformat(str(stamp))
+            return (
+                current - previous
+            ).total_seconds() > RELIABLE_HEARTBEAT_GRACE_SECONDS
         except (TypeError, ValueError):
             return False
 
     def _route_failed_run(
         self, conn, task: tasks_dao.TaskRow, run: runs_dao.RunRow
     ) -> tuple[int, int]:
-        if run.kind in {"plan", "ship"}:
-            return 0, 0
         classification = self._classify_run_failure(run)
+        if run.kind == "ship":
+            return 0, 0
         runs_dao.record_run_diagnostic(
             conn,
             run.id,
             failure_category=classification.category,
             failure_detail=classification.explain,
         )
+        if run.kind != "ship":
+            self._record_agent_failure(conn, run, classification)
+        if run.kind == "plan":
+            return 0, 0
+
         if run.kind == "review":
-            if run.attempt < 2 and self._create_retry_run(conn, task, run):
+            if (
+                run.attempt < 2
+                and classification.category
+                in {
+                    "agent_crash",
+                    "network",
+                    "unknown",
+                    "timeout",
+                    "hang",
+                    "lost_process",
+                    "invalid_result",
+                }
+                and self._agent_selectable(conn, run.agent)
+                and self._create_retry_run(conn, task, run)
+            ):
                 return 1, 0
             return 0, 0
 
-        if run.agent in {"claude", "claude-code"}:
+        if run.kind == "fallback":
+            if classification.category in {"quota", "session_limit", "auth"}:
+                return 0, self._move_task(conn, task, "blocked")
+            if (
+                run.attempt < 2
+                and classification.category
+                in {
+                    "agent_crash",
+                    "network",
+                    "unknown",
+                    "timeout",
+                    "hang",
+                    "lost_process",
+                }
+                and self._agent_selectable(conn, run.agent)
+                and self._create_retry_run(conn, task, run)
+            ):
+                return 1, 0
+            return 0, self._move_task(conn, task, "failed")
+
+        if run.kind in {"implement", "repair"}:
             if classification.category == "auth":
                 return 0, self._move_task(conn, task, "blocked")
-            if classification.category == "network":
-                if run.attempt < 2 and self._create_retry_run(conn, task, run):
+            if classification.category in {"network", "unknown"}:
+                if (
+                    run.attempt < 2
+                    and self._agent_selectable(conn, run.agent)
+                    and self._create_retry_run(conn, task, run)
+                ):
                     return 1, 0
                 return 0, self._move_task(conn, task, "blocked")
-            if classification.category == "unknown" and run.attempt < 2:
-                if self._create_retry_run(conn, task, run):
-                    return 1, 0
             if self._create_fallback_run(conn, task, run, classification.category):
                 return 1, 0
+            if classification.category in {"quota", "session_limit"}:
+                return 0, 0
             return 0, self._move_task(conn, task, "blocked")
-
-        if run.kind == "fallback" and run.agent == CODEX_REVIEW_AGENT:
-            if classification.category == "quota":
-                return 0, self._move_task(conn, task, "blocked")
-            if run.attempt < 2 and classification.category in {
-                "agent_crash", "network", "unknown", "timeout", "hang", "lost_process"
-            }:
-                if self._create_retry_run(conn, task, run):
-                    return 1, 0
-            return 0, self._move_task(conn, task, "failed")
         return 0, 0
 
     def _classify_run_failure(self, run: runs_dao.RunRow):
@@ -430,12 +524,21 @@ class LifecycleOrchestrator:
                 "quota", run.failure_detail or "Run was blocked by agent quota"
             )
         explicit = {
-            "quota", "session_limit", "agent_crash", "timeout", "hang", "auth",
-            "network", "ship_failure", "invalid_result", "lost_process",
+            "quota",
+            "session_limit",
+            "agent_crash",
+            "timeout",
+            "hang",
+            "auth",
+            "network",
+            "ship_failure",
+            "invalid_result",
+            "lost_process",
         }
         if run.failure_category in explicit:
+            category = cast(ReliableFailureCategory, run.failure_category)
             return ReliableFailureClassification(
-                run.failure_category, run.failure_detail or run.failure_category
+                category, run.failure_detail or category
             )
         return classify_reliable(
             launcher_rc=run.exit_code,
@@ -486,9 +589,16 @@ class LifecycleOrchestrator:
                 except StateError:
                     return False
                 worktree_path, branch_name, base_sha, head_sha = (
-                    worktree.path, None, target_sha, target_sha
+                    worktree.path,
+                    None,
+                    target_sha,
+                    target_sha,
                 )
-        elif metadata and failed_run.kind in {"repair", "fallback"} and self._is_git_repo():
+        elif (
+            metadata
+            and failed_run.kind in {"repair", "fallback"}
+            and self._is_git_repo()
+        ):
             try:
                 worktree = create_repair_worktree(
                     self.project_dir,
@@ -546,6 +656,17 @@ class LifecycleOrchestrator:
     def _create_fallback_run(
         self, conn, task: tasks_dao.TaskRow, failed_run: runs_dao.RunRow, category: str
     ) -> bool:
+        assignment = self._select_mutator(
+            conn, task, preferred_agent=None, exclude_agents={failed_run.agent}
+        )
+        if assignment is None:
+            runs_dao.record_run_diagnostic(
+                conn,
+                failed_run.id,
+                failure_category=category,
+                failure_detail="no eligible alternate mutating agent is currently available",
+            )
+            return False
         metadata = self._pr_metadata(task)
         worktree_path = None
         branch_name = None
@@ -572,13 +693,6 @@ class LifecycleOrchestrator:
             branch_name = metadata["branch_name"]
             base_sha = metadata["pr_head_sha"]
             head_sha = metadata["pr_head_sha"]
-        elif failed_run.worktree_path and self._safe_task_worktree(
-            task, failed_run.worktree_path
-        ):
-            worktree_path, branch_name = (
-                failed_run.worktree_path,
-                failed_run.branch_name or reliable_task_branch(task.id),
-            )
         else:
             if not base_sha:
                 return False
@@ -595,9 +709,9 @@ class LifecycleOrchestrator:
             conn,
             task,
             kind="fallback",
-            dedupe_key=f"fallback:{task.id}:{failed_run.id}:codex-cli",
-            agent=CODEX_REVIEW_AGENT,
-            model=self._fallback_model_name(),
+            dedupe_key=f"fallback:{task.id}:{failed_run.id}:{assignment.agent}",
+            agent=assignment.agent,
+            model=assignment.model,
             parent_run_id=failed_run.id,
             trigger_run_id=failed_run.id,
             prompt=prompt,
@@ -611,7 +725,9 @@ class LifecycleOrchestrator:
         return True
 
     def _safe_task_worktree(self, task: tasks_dao.TaskRow, path: str) -> bool:
-        if not self._is_git_repo() or not is_managed_worktree_path(self.project_dir, path):
+        if not self._is_git_repo() or not is_managed_worktree_path(
+            self.project_dir, path
+        ):
             return False
         try:
             return current_branch_name(path) == reliable_task_branch(task.id) and bool(
@@ -623,14 +739,15 @@ class LifecycleOrchestrator:
     def _fallback_prompt(self, conn, task, failed_run, category, metadata):
         scope = "\n".join(f"- {item}" for item in task.acceptance_criteria) or "- none"
         lines = [
-            "=== RELIABLE ORCHESTRATOR CODEX FALLBACK ===",
+            "=== RELIABLE ORCHESTRATOR FALLBACK ===",
             "Continue the SAME task. Do not make unrelated changes.",
             "Do not commit, push, ship, merge, enable auto-merge, or close the task.",
             "System shipping owns commit, push, PR update, and SHA confirmation.",
             f"Task: {task.id} - {task.title}",
             "Authoritative acceptance criteria:",
             scope,
-            f"Failed Claude Run: {failed_run.id}",
+            f"Failed source Run: {failed_run.id}",
+            f"Failed source agent: {failed_run.agent}",
             f"Failure category: {category}",
             f"Current branch: {failed_run.branch_name or (metadata or {}).get('branch_name') or 'task branch'}",
             f"Current/base SHA: {failed_run.head_sha or failed_run.base_sha or (metadata or {}).get('pr_head_sha') or 'recorded Run state'}",
@@ -657,9 +774,6 @@ class LifecycleOrchestrator:
             "Run appropriate focused tests and write the structured result JSON to SUPERHARNESS_RUN_RESULT_PATH."
         )
         return "\n".join(lines)
-
-    def _fallback_model_name(self) -> str:
-        return str(self._profile().get("codex_implementation_model") or "gpt-5.5")
 
     def _terminalize_inbox(self, conn, run: runs_dao.RunRow, *, failed: bool) -> None:
         if not run.inbox_id:
@@ -690,6 +804,14 @@ class LifecycleOrchestrator:
         ]
         if existing:
             return 0, 0
+        assignment = self._select_reviewer(
+            conn,
+            task,
+            source_agent=metadata.get("source_agent"),
+            preferred_agent=self._review_agent,
+        )
+        if assignment is None:
+            return 0, 0
         worktree = None
         if self._is_git_repo():
             try:
@@ -707,8 +829,8 @@ class LifecycleOrchestrator:
             task,
             kind="review",
             dedupe_key=f"review:{task.id}:{review_target_sha}",
-            agent=self._review_agent_name(),
-            model=self._review_model_name(),
+            agent=assignment.agent,
+            model=self._review_model if self._review_model else assignment.model,
             review_target_sha=review_target_sha,
             prompt=prompt,
             worktree_path=worktree.path if worktree else None,
@@ -899,6 +1021,19 @@ class LifecycleOrchestrator:
                 ),
             )
             return 0
+        assignment = self._select_mutator(
+            conn,
+            task,
+            preferred_agent=metadata.get("source_agent"),
+        )
+        if assignment is None:
+            runs_dao.record_run_diagnostic(
+                conn,
+                rejected_review_run.id,
+                failure_category="repair_blocked",
+                failure_detail="no eligible mutating agent is currently available",
+            )
+            return 0
         worktree = None
         if self._is_git_repo():
             try:
@@ -922,7 +1057,8 @@ class LifecycleOrchestrator:
             task,
             kind="repair",
             dedupe_key=f"repair:{task.id}:{rejected_review_run.id}",
-            agent=self._agent_for(task),
+            agent=assignment.agent,
+            model=assignment.model,
             trigger_run_id=rejected_review_run.id,
             worktree_path=worktree.path if worktree else None,
             branch_name=metadata["branch_name"],
@@ -985,6 +1121,10 @@ class LifecycleOrchestrator:
             "pr_head_sha": pr_head_sha,
             "pr_number": pr_number,
             "pr_url": pr_url,
+            "ship_run_id": metadata.get("ship_run_id"),
+            "source_run_id": metadata.get("source_run_id"),
+            "source_run_kind": metadata.get("source_run_kind"),
+            "source_agent": metadata.get("source_agent"),
         }
 
     def _review_prompt(self, task: tasks_dao.TaskRow, metadata: dict[str, Any]) -> str:
@@ -1160,6 +1300,11 @@ class LifecycleOrchestrator:
             extras = {}
         if not isinstance(extras, dict):
             extras = {}
+        source_run = (
+            runs_dao.get_run(conn, ship_run.parent_run_id)
+            if ship_run.parent_run_id
+            else None
+        )
         existing = extras.get("reliable_orchestrator")
         existing_metadata = existing if isinstance(existing, dict) else {}
         existing_metadata.update(
@@ -1172,6 +1317,11 @@ class LifecycleOrchestrator:
                 "pr_number": ship_run.pr_number,
                 "pr_url": ship_run.pr_url,
                 "ship_run_id": ship_run.id,
+                "source_run_id": source_run.id
+                if source_run
+                else ship_run.parent_run_id,
+                "source_run_kind": source_run.kind if source_run else None,
+                "source_agent": source_run.agent if source_run else None,
             }
         )
         extras["reliable_orchestrator"] = existing_metadata
@@ -1239,13 +1389,78 @@ class LifecycleOrchestrator:
             changes["contract_locked_at"] = now
         tasks_dao.update(conn, task.id, task.version, changes)
 
+    def _select_mutator(
+        self,
+        conn,
+        task: tasks_dao.TaskRow,
+        *,
+        preferred_agent: str | None = None,
+        exclude_agents: set[str] | None = None,
+    ) -> AgentAssignment | None:
+        preferred = preferred_agent or self._agent_for(task)
+        return self._selector().select_mutator(
+            conn,
+            now=self._now(),
+            preferred_agent=preferred,
+            exclude_agents=exclude_agents,
+        )
+
+    def _select_reviewer(
+        self,
+        conn,
+        task: tasks_dao.TaskRow,
+        *,
+        source_agent: str | None,
+        preferred_agent: str | None = None,
+    ) -> AgentAssignment | None:
+        del task
+        return self._selector().select_reviewer(
+            conn,
+            now=self._now(),
+            source_agent=source_agent,
+            preferred_agent=preferred_agent,
+        )
+
+    def _agent_selectable(self, conn, agent: str) -> bool:
+        return agent_availability.is_selectable(conn, agent, now=self._now())
+
+    def _record_agent_success(self, conn, run: runs_dao.RunRow) -> None:
+        if run.agent == SYSTEM_AGENT:
+            return
+        agent_availability.mark_success(
+            conn, run.agent, now=self._now(), source_run_id=run.id
+        )
+
+    def _record_agent_failure(
+        self,
+        conn,
+        run: runs_dao.RunRow,
+        classification: ReliableFailureClassification,
+    ) -> None:
+        if (
+            run.agent == SYSTEM_AGENT
+            or classification.category not in AGENT_FAILURE_CATEGORIES
+        ):
+            return
+        agent_availability.mark_failure(
+            conn,
+            run.agent,
+            category=classification.category,
+            detail=classification.explain,
+            now=self._now(),
+            source_run_id=run.id,
+        )
+
+    def _selector(self) -> AgentSelector:
+        return AgentSelector(self._profile())
+
     def _agent_for(self, task: tasks_dao.TaskRow) -> str:
         if self._primary_agent:
             return self._primary_agent
         if task.owner:
             return task.owner
         profile = self._profile()
-        return str(profile.get("primary_agent") or "claude-code")
+        return str(profile.get("primary_agent") or CLAUDE_AGENT)
 
     def _auto_approve_enabled(self) -> bool:
         if self._auto_approve is not None:
@@ -1255,7 +1470,7 @@ class LifecycleOrchestrator:
     def _review_agent_name(self) -> str:
         if self._review_agent:
             return self._review_agent
-        return str(self._profile().get("review_agent") or CODEX_REVIEW_AGENT)
+        return str(self._profile().get("review_agent") or CODEX_AGENT)
 
     def _review_model_name(self) -> str:
         if self._review_model:
@@ -1263,16 +1478,21 @@ class LifecycleOrchestrator:
         return str(
             self._profile().get("codex_review_model")
             or self._profile().get("review_model")
-            or DEFAULT_CODEX_REVIEW_MODEL
+            or DEFAULT_CODEX_MODEL
         )
 
     def _profile(self) -> dict[str, Any]:
+        if self._profile_cache is not None:
+            return self._profile_cache
         path = os.path.join(self.project_dir, ".superharness", "profile.yaml")
         if not os.path.isfile(path):
-            return {}
+            self._profile_cache = {}
+            return self._profile_cache
         try:
             with open(path, encoding="utf-8") as handle:
                 value = yaml.safe_load(handle) or {}
-            return value if isinstance(value, dict) else {}
+            self._profile_cache = value if isinstance(value, dict) else {}
+            return self._profile_cache
         except (OSError, yaml.YAMLError):
-            return {}
+            self._profile_cache = {}
+            return self._profile_cache

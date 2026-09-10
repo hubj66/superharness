@@ -20,9 +20,9 @@ def test_migration_creates_context_component_tables(tmp_path):
         }
         assert "context_component" in tables
         assert "dispatch_context" in tables
+        assert "agent_availability" in tables
 
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         assert version == CURRENT_SCHEMA_VERSION
-        assert CURRENT_SCHEMA_VERSION == 41
     finally:
         conn.close()

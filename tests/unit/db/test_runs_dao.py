@@ -437,14 +437,18 @@ def test_reliable_orchestrator_feature_gate_is_opt_in(db_conn):
 
     assert not is_reliable_orchestrated_task(legacy)
     assert is_reliable_orchestrated_task(reliable)
-    assert is_reliable_orchestrated_task({"extras_json": '{"reliable_orchestrator": true}'})
+    assert is_reliable_orchestrated_task(
+        {"extras_json": '{"reliable_orchestrator": true}'}
+    )
 
 
 def test_migration_from_v39_database_succeeds():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
     conn.execute(
         "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, "
         "version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)"
@@ -465,11 +469,16 @@ def test_migration_from_v39_database_succeeds():
 
     init_db(conn)
 
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 41
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 42
     assert conn.execute("SELECT name FROM sqlite_master WHERE name='runs'").fetchone()
     assert conn.execute(
         "SELECT name FROM sqlite_master WHERE name='orchestrator_lease'"
     ).fetchone()
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(inbox)").fetchall()}
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE name='agent_availability'"
+    ).fetchone()
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(inbox)").fetchall()
+    }
     assert "run_id" in columns
     conn.close()
