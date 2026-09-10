@@ -371,9 +371,10 @@ def _reliable_run_dispatch_statuses(
     *,
     task_id: str,
     target: str,
+    model_override: str,
     plan_only: bool,
     for_review: bool,
-) -> tuple[set[str] | None, str | None]:
+) -> tuple[set[str] | None, str | None, str | None]:
     """Validate a reliable-orchestrator dispatch against its durable Run.
 
     Reliable lifecycle dispatch is owned by LifecycleOrchestrator. When a
@@ -383,7 +384,7 @@ def _reliable_run_dispatch_statuses(
 
     run_id = os.environ.get("SUPERHARNESS_RUN_ID", "").strip()
     if not run_id:
-        return None, None
+        return None, None, None
 
     from superharness.engine import runs_dao
     from superharness.engine.db import managed_connection
@@ -392,44 +393,67 @@ def _reliable_run_dispatch_statuses(
         with managed_connection(project_dir) as conn:
             run = runs_dao.get_run(conn, run_id)
     except (OSError, sqlite3.Error, StateError) as exc:
-        return None, f"could not read reliable Run '{run_id}': {exc}"
+        return None, f"could not read reliable Run '{run_id}': {exc}", None
 
     if run is None:
-        return None, f"reliable Run '{run_id}' not found"
+        return None, f"reliable Run '{run_id}' not found", None
     if run.task_id != task_id:
-        return None, (
-            f"reliable Run '{run_id}' belongs to task '{run.task_id}', not '{task_id}'"
+        return (
+            None,
+            f"reliable Run '{run_id}' belongs to task '{run.task_id}', not '{task_id}'",
+            None,
         )
     if run.agent != target:
-        return None, (
-            f"reliable Run '{run_id}' targets agent '{run.agent}', not '{target}'"
+        return (
+            None,
+            f"reliable Run '{run_id}' targets agent '{run.agent}', not '{target}'",
+            None,
+        )
+    if not run.model:
+        return None, f"reliable Run '{run_id}' has no persisted model", None
+    if model_override and model_override != run.model:
+        return (
+            None,
+            f"reliable Run '{run_id}' uses model '{run.model}', not '{model_override}'",
+            None,
         )
 
     if run.kind == "plan":
         if not plan_only or for_review:
-            return None, f"reliable plan Run '{run_id}' must dispatch with --plan-only"
+            return (
+                None,
+                f"reliable plan Run '{run_id}' must dispatch with --plan-only",
+                None,
+            )
     elif run.kind == "review":
         if plan_only or not for_review:
             return (
                 None,
                 f"reliable review Run '{run_id}' must dispatch with --for-review",
+                None,
             )
     elif run.kind in {"implement", "fallback", "repair"}:
         if plan_only or for_review:
-            return None, (
-                f"reliable {run.kind} Run '{run_id}' must dispatch as worker execution"
+            return (
+                None,
+                f"reliable {run.kind} Run '{run_id}' must dispatch as worker execution",
+                None,
             )
     elif run.kind == "ship":
-        return None, f"reliable ship Run '{run_id}' is system-owned and not delegable"
+        return (
+            None,
+            f"reliable ship Run '{run_id}' is system-owned and not delegable",
+            None,
+        )
     else:
-        return None, f"reliable Run '{run_id}' has unsupported kind '{run.kind}'"
+        return None, f"reliable Run '{run_id}' has unsupported kind '{run.kind}'", None
 
     from superharness.engine.next_action import reliable_dispatch_statuses_for_run_kind
 
     statuses = reliable_dispatch_statuses_for_run_kind(run.kind)
     if not statuses:
-        return None, f"reliable Run kind '{run.kind}' is not agent-dispatchable"
-    return statuses, None
+        return None, f"reliable Run kind '{run.kind}' is not agent-dispatchable", None
+    return statuses, None, run.model
 
 
 # ---------------------------------------------------------------------------
@@ -970,14 +994,17 @@ def delegate(
             file=sys.stderr,
         )
     _reliable_run_gate_error = None
+    _reliable_run_model = None
     if _workflow == "reliable-orchestrator":
         (
             _DISPATCH_ALLOWED_STATUSES,
             _reliable_run_gate_error,
+            _reliable_run_model,
         ) = _reliable_run_dispatch_statuses(
             project_dir,
             task_id=task_id,
             target=target,
+            model_override=model_override,
             plan_only=plan_only,
             for_review=for_review,
         )
@@ -1095,9 +1122,13 @@ def delegate(
     resolved_model = ""
     resolved_effort = ""
     model_source = "fallback"
+    reliable_run_bound = bool(_reliable_run_model)
+    if _reliable_run_model:
+        resolved_model = _reliable_run_model
+        model_source = "reliable-run"
 
     # 0. Role-based routing (lower priority than explicit CLI flag)
-    if role and role != "worker" and not model_override:
+    if not reliable_run_bound and role and role != "worker" and not model_override:
         try:
             from superharness.engine.model_router_roles import ModelRouter
 
@@ -1108,7 +1139,7 @@ def delegate(
             logger.warning("delegate.py unexpected error: %s", e, exc_info=True)
             pass
     # 1. CLI flag (overrides role routing)
-    if model_override:
+    if not reliable_run_bound and model_override:
         resolved_model = model_override
         model_source = "manual"
     if effort_override:
@@ -1128,6 +1159,7 @@ def delegate(
     # 3. Auto-classification (skip if print_only — don't call Claude for a preview)
     if (
         not print_only
+        and not reliable_run_bound
         and not no_auto_model
         and (not resolved_model or not resolved_effort)
     ):
@@ -1200,37 +1232,39 @@ def delegate(
         resolved_effort = "medium"
 
     # If model_override was a tier name, resolve to agent-specific model
-    try:
-        from superharness.engine.model_router import (
-            resolve_tier,
-            resolve_model_for_tier,
-        )
+    if not reliable_run_bound:
+        try:
+            from superharness.engine.model_router import (
+                resolve_tier,
+                resolve_model_for_tier,
+            )
 
-        tier = resolve_tier(resolved_model)
-        if tier:
-            resolved_model = resolve_model_for_tier(target, tier, project_dir)
-    except Exception as e:
-        logger.warning("delegate.py unexpected error: %s", e, exc_info=True)
-        pass
+            tier = resolve_tier(resolved_model)
+            if tier:
+                resolved_model = resolve_model_for_tier(target, tier, project_dir)
+        except Exception as e:
+            logger.warning("delegate.py unexpected error: %s", e, exc_info=True)
+            pass
     # Apply ChatGPT-account overrides last so every resolution path
     # (CLI, task field, auto-classify via adapter_registry, profile,
     # fallback, tier-reroute) gets remapped when codex is signed in via
     # ChatGPT. Without this, gpt-5.3-codex reaches the codex CLI and 400s.
-    try:
-        from superharness.engine.model_router import _apply_chatgpt_auth_override
+    if not reliable_run_bound:
+        try:
+            from superharness.engine.model_router import _apply_chatgpt_auth_override
 
-        resolved_model = _apply_chatgpt_auth_override(
-            target, resolved_model, project_dir
-        )
-    except Exception as e:
-        logger.warning("delegate.py unexpected error: %s", e, exc_info=True)
-        pass
+            resolved_model = _apply_chatgpt_auth_override(
+                target, resolved_model, project_dir
+            )
+        except Exception as e:
+            logger.warning("delegate.py unexpected error: %s", e, exc_info=True)
+            pass
     # -----------------------------------------------------------------------
     # Auto-orchestrate: let the best model decide owner+tier+effort+decompose.
     # Default path. Skip with --no-orchestrate for trivial tasks.
     # --orchestrate flag forces this path (backward compat, same behavior).
     # -----------------------------------------------------------------------
-    should_orchestrate = not no_orchestrate
+    should_orchestrate = not no_orchestrate and not reliable_run_bound
     # Discussion rounds need multi-agent perspectives — skip orchestrator.
     # The orchestrator would reroute every agent to the same "best" model,
     # defeating the purpose of multi-agent deliberation.

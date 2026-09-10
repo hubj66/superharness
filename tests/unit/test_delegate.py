@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
@@ -94,7 +95,15 @@ def test_delegate_shorthand_preserves_pi_owner(monkeypatch, tmp_path: Path) -> N
     assert received == [
         (
             "superharness.commands.delegate",
-            ("--to", "pi", "--task", "pi-task", "--project", str(project), "--print-only"),
+            (
+                "--to",
+                "pi",
+                "--task",
+                "pi-task",
+                "--project",
+                str(project),
+                "--print-only",
+            ),
         )
     ]
 
@@ -144,9 +153,9 @@ def test_delegate_shorthand_runs_fake_pi_with_target_correct_prompt(
         "import json, os, sys\n"
         f"with open({str(record)!r}, 'w', encoding='utf-8') as stream:\n"
         "    json.dump({'argv': sys.argv[1:], 'cwd': os.getcwd()}, stream)\n"
-        "sys.stdout.write('{\"type\":\"session\",\"version\":3,\"id\":\"fixture-session\"}\\n')\n"
-        "sys.stdout.write('{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"fixture result\"}],\"provider\":\"provider-a\",\"model\":\"model-a\",\"usage\":{},\"cost\":{},\"stopReason\":\"stop\"}}\\n')\n"
-        "sys.stdout.write('{\"type\":\"agent_end\",\"messages\":[]}\\n')\n",
+        'sys.stdout.write(\'{"type":"session","version":3,"id":"fixture-session"}\\n\')\n'
+        'sys.stdout.write(\'{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"fixture result"}],"provider":"provider-a","model":"model-a","usage":{},"cost":{},"stopReason":"stop"}}\\n\')\n'
+        'sys.stdout.write(\'{"type":"agent_end","messages":[]}\\n\')\n',
         encoding="utf-8",
     )
     fake_pi.chmod(0o755)
@@ -209,7 +218,9 @@ def test_pi_prompt_names_pi_not_codex() -> None:
     assert "codex-cli" not in prompt
 
 
-@pytest.mark.parametrize("target", ["claude-code", "codex-cli", "gemini-cli", "opencode"])
+@pytest.mark.parametrize(
+    "target", ["claude-code", "codex-cli", "gemini-cli", "opencode"]
+)
 def test_task_prompt_names_each_existing_target(target: str) -> None:
     """Existing harnesses retain target-correct task prompt addressing."""
     from superharness.commands.delegate import _build_task_execution_prompt
@@ -237,7 +248,9 @@ def test_inbox_watch_accepts_pi_target(monkeypatch, tmp_path: Path) -> None:
         inbox_watch, "watch", lambda **kwargs: watch_kwargs.update(kwargs) or 0
     )
 
-    monkeypatch.setattr(sys, "argv", ["inbox_watch", "--project", str(tmp_path), "--to", "pi"])
+    monkeypatch.setattr(
+        sys, "argv", ["inbox_watch", "--project", str(tmp_path), "--to", "pi"]
+    )
     with pytest.raises(SystemExit) as exc_info:
         inbox_watch.main()
 
@@ -456,6 +469,7 @@ def _setup_reliable_run_project(
     status: str,
     run_kind: str,
     agent: str = "claude-code",
+    model: str | None = None,
 ) -> tuple[Path, str]:
     project = tmp_path / f"proj_reliable_{run_kind}_{status}"
     project.mkdir()
@@ -495,7 +509,9 @@ def _setup_reliable_run_project(
             task_id="gh-1-r2",
             kind=run_kind,
             agent=agent,
-            model="claude-sonnet-4-6" if agent == "claude-code" else "gpt-5.5",
+            model=model
+            if model is not None
+            else ("claude-sonnet-4-6" if agent == "claude-code" else "gpt-5.5"),
             dedupe_key=f"{run_kind}:gh-1-r2:test",
             review_target_sha="sha-review" if run_kind == "review" else None,
             now="2026-01-01T00:00:00Z",
@@ -638,6 +654,89 @@ def test_delegate_blocks_reliable_run_task_mismatch(tmp_path):
     assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
     assert "belongs to task 'gh-1-r2'" in r.stderr
 
+
+@pytest.mark.parametrize(
+    ("run_kind", "status", "agent", "model", "extra_kwargs"),
+    [
+        (
+            "plan",
+            "todo",
+            "claude-code",
+            "claude-sonnet-4-6",
+            {"plan_only": True},
+        ),
+        ("implement", "in_progress", "claude-code", "claude-sonnet-4-6", {}),
+        ("fallback", "in_progress", "codex-cli", "gpt-5.5", {}),
+        ("repair", "in_progress", "claude-code", "claude-sonnet-4-6", {}),
+        (
+            "review",
+            "review_requested",
+            "codex-cli",
+            "gpt-5.5",
+            {"for_review": True},
+        ),
+    ],
+)
+def test_delegate_reliable_run_assignment_is_authoritative(
+    tmp_path, run_kind, status, agent, model, extra_kwargs
+):
+    project, run_id = _setup_reliable_run_project(
+        tmp_path, status=status, run_kind=run_kind, agent=agent, model=model
+    )
+    from superharness.commands.delegate import delegate
+
+    with (
+        patch.dict(os.environ, {"SUPERHARNESS_RUN_ID": run_id}),
+        patch("superharness.engine.orchestrator.Orchestrator") as orchestrator,
+        patch("superharness.commands.delegate._launch_agent") as launch,
+    ):
+        rc = delegate(
+            project_dir=str(project),
+            target=agent,
+            task_id="gh-1-r2",
+            print_only=True,
+            non_interactive=False,
+            codex_bypass=False,
+            orchestrate=True,
+            no_auto_model=False,
+            **extra_kwargs,
+        )
+
+    assert rc == 0
+    orchestrator.assert_not_called()
+    launch.assert_called_once()
+    assert launch.call_args.args[0] == agent
+    assert launch.call_args.kwargs["model"] == model
+
+
+def test_delegate_reliable_run_model_mismatch_fails_closed(tmp_path):
+    project, run_id = _setup_reliable_run_project(
+        tmp_path,
+        status="todo",
+        run_kind="plan",
+        agent="claude-code",
+        model="claude-sonnet-4-6",
+    )
+
+    r = _run_delegate_py(
+        project,
+        args=[
+            "--to",
+            "claude-code",
+            "--project",
+            str(project),
+            "--task",
+            "gh-1-r2",
+            "--print-only",
+            "--plan-only",
+            "--model",
+            "gpt-5-codex",
+        ],
+        env={"SUPERHARNESS_RUN_ID": run_id},
+    )
+
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert "uses model 'claude-sonnet-4-6', not 'gpt-5-codex'" in r.stderr
 
 
 

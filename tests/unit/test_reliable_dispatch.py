@@ -214,6 +214,44 @@ def test_nonzero_delegate_exit_cannot_succeed_reliable_run(tmp_path, exit_code):
         conn.close()
 
 
+def test_sigsegv_delegate_exit_records_reliable_crash(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _sqlite_claim_next(str(project), "claude-code", NOW)
+        ctx = DispatchContext(
+            project_dir=str(project),
+            inbox_file=str(project / ".superharness" / "inbox.yaml"),
+            contract_file=str(project / ".superharness" / "contract.yaml"),
+            print_only=False,
+            non_interactive=True,
+            codex_bypass=False,
+            launcher_timeout=0,
+            script_dir=str(project),
+            sqlite_primary=True,
+            item_id="inbox-1",
+            item_task="t1",
+            item_to="claude-code",
+            item_project=str(project),
+            exec_project=str(project),
+            run_id="run-1",
+            item={"plan_only": False},
+        )
+        _prepare_execution(ctx)
+        _reliable_run_started(ctx, pid=None)
+        ctx.launcher_rc = 139
+        _reliable_run_finished(ctx)
+
+        run = runs_dao.get_run(conn, "run-1")
+        assert run is not None
+        assert run.status == "crashed"
+        assert run.failure_category == "agent_crash"
+        assert run.result_json["exit_code"] == 139
+        assert inbox_dao.get(conn, "inbox-1").status == "failed"
+        assert runs_dao.list_runs_for_task(conn, "t1", kind="ship") == []
+    finally:
+        conn.close()
+
+
 def test_linked_run_preserves_orchestrator_worktree_path(tmp_path):
     project, conn = _project(tmp_path)
     worktree = tmp_path / "superharness-worktrees" / "wt"

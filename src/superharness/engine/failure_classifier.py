@@ -212,7 +212,8 @@ _RELIABLE_QUOTA = (
 )
 _RELIABLE_AUTH = (
     r"authentication|unauthori[sz]ed|invalid api key|api key not valid|"
-    r"permission denied|login required|not logged in|forbidden"
+    r"permission denied|login required|not logged in|forbidden|"
+    r"model is not supported when using codex with a chatgpt account"
 )
 _RELIABLE_NETWORK = (
     r"network|connection (?:reset|refused|timed out)|timed out connecting|"
@@ -245,9 +246,13 @@ def classify_reliable(
             "lost_process", "Run process could not be verified after watcher recovery"
         )
     if timed_out:
-        return ReliableFailureClassification("timeout", "configured Run timeout expired")
+        return ReliableFailureClassification(
+            "timeout", "configured Run timeout expired"
+        )
     if hung:
-        return ReliableFailureClassification("hang", "Run heartbeat/liveness policy expired")
+        return ReliableFailureClassification(
+            "hang", "Run heartbeat/liveness policy expired"
+        )
     if launcher_rc in {139, -11}:
         return ReliableFailureClassification(
             "agent_crash", "agent terminated with SIGSEGV (exit 139)"
@@ -257,11 +262,17 @@ def classify_reliable(
             "agent_crash", f"agent terminated by signal {-launcher_rc}"
         )
     if re.search(r"segmentation fault|sigsegv|panic:|traceback", haystack, re.I):
-        return ReliableFailureClassification("agent_crash", "agent crash evidence in output")
+        return ReliableFailureClassification(
+            "agent_crash", "agent crash evidence in output"
+        )
     if re.search(_RELIABLE_SESSION_LIMIT, haystack, re.I):
-        return ReliableFailureClassification("session_limit", "agent session limit reached")
+        return ReliableFailureClassification(
+            "session_limit", "agent session limit reached"
+        )
     if re.search(_RELIABLE_QUOTA, haystack, re.I):
-        return ReliableFailureClassification("quota", "agent quota or rate limit reached")
+        return ReliableFailureClassification(
+            "quota", "agent quota or rate limit reached"
+        )
     if re.search(_RELIABLE_AUTH, haystack, re.I):
         return ReliableFailureClassification("auth", "agent authentication failed")
     if re.search(_RELIABLE_NETWORK, haystack, re.I):

@@ -51,6 +51,7 @@ from superharness.engine.state_errors import BoundaryError, StateError
 
 _ACTIVE_INBOX_STATUSES = ("pending", "launched", "running", "paused")
 RELIABLE_HEARTBEAT_GRACE_SECONDS = 15 * 60
+RELIABLE_DISPATCH_FINALIZATION_GRACE_SECONDS = 60
 AGENT_FAILURE_CATEGORIES = frozenset(
     {
         "quota",
@@ -416,6 +417,11 @@ class LifecycleOrchestrator:
                     pid_starttime=run.pid_starttime,
                 )
                 continue
+            if process_state in {
+                "dead",
+                "reused",
+            } and self._dispatcher_may_be_finalizing(conn, run):
+                continue
             if process_state in {"dead", "reused"} or self._heartbeat_expired(run):
                 category = (
                     "lost_process"
@@ -430,6 +436,25 @@ class LifecycleOrchestrator:
                     failure_category=category,
                     failure_detail=f"process probe: {process_state}",
                 )
+
+    def _dispatcher_may_be_finalizing(self, conn, run: runs_dao.RunRow) -> bool:
+        """Avoid racing the dispatcher between child reap and terminal Run write."""
+        if not run.inbox_id:
+            return False
+        row = inbox_dao.get(conn, run.inbox_id)
+        if row is None or row.status not in {"launched", "running"}:
+            return False
+        stamp = run.heartbeat_at or run.started_at
+        if not stamp:
+            return False
+        try:
+            current = datetime.fromisoformat(self._now())
+            previous = datetime.fromisoformat(str(stamp))
+        except (TypeError, ValueError):
+            return False
+        return (
+            current - previous
+        ).total_seconds() <= RELIABLE_DISPATCH_FINALIZATION_GRACE_SECONDS
 
     def _heartbeat_expired(self, run: runs_dao.RunRow) -> bool:
         stamp = run.heartbeat_at or run.started_at
