@@ -13,6 +13,7 @@ AVAILABILITY_STATES = frozenset(
 TEMPORARY_BLOCK_CATEGORIES = frozenset({"quota", "session_limit"})
 AUTH_BLOCK_CATEGORIES = frozenset({"auth"})
 DEFAULT_BLOCK_MINUTES = 60
+AUTH_RETRY_COOLDOWN_MINUTES = 60
 
 
 @dataclass(frozen=True)
@@ -48,7 +49,9 @@ def is_selectable(conn: sqlite3.Connection, agent: str, *, now: str) -> bool:
     if record.state in {"available", "unknown"}:
         return True
     if record.state == "auth_blocked":
-        return False
+        return _eligible_after(record.retry_after_at, now) and _eligible_after(
+            record.blocked_until, now
+        )
     if record.state == "temporarily_blocked":
         return _eligible_after(record.retry_after_at, now) and _eligible_after(
             record.blocked_until, now
@@ -110,6 +113,8 @@ def mark_failure(
         blocked_until = retry_after_at or _add_minutes(now, default_block_minutes)
     elif category in AUTH_BLOCK_CATEGORIES:
         state = "auth_blocked"
+        retry_after_at = parse_retry_after_at(detail or "", now=now)
+        blocked_until = retry_after_at or _add_minutes(now, AUTH_RETRY_COOLDOWN_MINUTES)
 
     conn.execute(
         """

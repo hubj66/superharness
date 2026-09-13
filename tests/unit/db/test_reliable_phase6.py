@@ -11,7 +11,9 @@ from superharness.engine.lifecycle_orchestrator import LifecycleOrchestrator
 from superharness.engine.shipper import ShipOutcome
 
 NOW = "2026-01-01T00:00:00Z"
+SOON = "2026-01-01T00:30:00Z"
 LATER = "2026-01-01T02:00:00Z"
+OLD = "2025-12-31T22:00:00Z"
 
 
 class FakeShipper:
@@ -209,7 +211,12 @@ def test_agent_availability_marks_quota_auth_network_and_success(db_conn):
         now=NOW,
         source_run_id=None,
     )
-    assert not agent_availability.is_selectable(db_conn, "claude-code", now=LATER)
+    record = agent_availability.get(db_conn, "claude-code")
+    assert record is not None
+    assert record.state == "auth_blocked"
+    assert record.blocked_until == "2026-01-01T01:00:00Z"
+    assert not agent_availability.is_selectable(db_conn, "claude-code", now=SOON)
+    assert agent_availability.is_selectable(db_conn, "claude-code", now=LATER)
 
     agent_availability.mark_failure(
         db_conn,
@@ -225,6 +232,49 @@ def test_agent_availability_marks_quota_auth_network_and_success(db_conn):
         db_conn, "claude-code", now=LATER, source_run_id=None
     )
     assert agent_availability.get(db_conn, "claude-code").state == "available"
+
+
+def test_auth_block_cooldown_refresh_and_success_recovery(db_conn):
+    agent_availability.mark_failure(
+        db_conn,
+        "codex-cli",
+        category="auth",
+        detail="agent authentication failed",
+        now=OLD,
+        source_run_id=None,
+    )
+    stale = agent_availability.get(db_conn, "codex-cli")
+    assert stale is not None
+    assert stale.state == "auth_blocked"
+    assert agent_availability.is_selectable(db_conn, "codex-cli", now=NOW)
+
+    agent_availability.mark_failure(
+        db_conn,
+        "codex-cli",
+        category="auth",
+        detail="agent authentication failed",
+        now=NOW,
+        source_run_id=None,
+    )
+    refreshed = agent_availability.get(db_conn, "codex-cli")
+    assert refreshed is not None
+    assert refreshed.state == "auth_blocked"
+    assert refreshed.blocked_until == "2026-01-01T01:00:00Z"
+    assert refreshed.last_failure_at == NOW
+    assert refreshed.source_run_id is None
+    assert not agent_availability.is_selectable(db_conn, "codex-cli", now=SOON)
+
+    agent_availability.mark_success(
+        db_conn,
+        "codex-cli",
+        now=LATER,
+        source_run_id=None,
+    )
+    recovered = agent_availability.get(db_conn, "codex-cli")
+    assert recovered is not None
+    assert recovered.state == "available"
+    assert recovered.blocked_until is None
+    assert recovered.retry_after_at is None
 
 
 def test_selector_prefers_claude_then_codex_and_honors_blocks(db_conn):
@@ -381,6 +431,118 @@ def test_reviewer_excludes_source_agent_and_waits_if_only_self_available(tmp_pat
         assert review.agent == "claude-code"
         assert review.review_target_sha == "sha-a"
         assert tasks_dao.get(conn, "t1").status == "review_requested"
+    finally:
+        conn.close()
+
+
+def test_pr_open_with_fresh_codex_auth_block_waits_without_self_review(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="pr_open", extras=_metadata(source_agent="claude-code"))
+        agent_availability.mark_failure(
+            conn,
+            "codex-cli",
+            category="auth",
+            detail="agent authentication failed",
+            now=NOW,
+            source_run_id=None,
+        )
+        conn.commit()
+        LifecycleOrchestrator(str(project), now=lambda: NOW).tick("t1")
+        assert runs_dao.list_runs_for_task(conn, "t1", kind="review") == []
+        assert tasks_dao.get(conn, "t1").status == "pr_open"
+    finally:
+        conn.close()
+
+
+def test_pr_open_with_expired_codex_auth_block_creates_one_review(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="pr_open", extras=_metadata(source_agent="claude-code"))
+        agent_availability.mark_failure(
+            conn,
+            "codex-cli",
+            category="auth",
+            detail="agent authentication failed",
+            now=OLD,
+            source_run_id=None,
+        )
+        conn.commit()
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        orch.tick("t1")
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        task = tasks_dao.get(conn, "t1")
+        assert len(reviews) == 1
+        assert reviews[0].agent == "codex-cli"
+        assert reviews[0].review_target_sha == "sha-a"
+        assert task is not None and task.status == "review_requested"
+    finally:
+        conn.close()
+
+
+def test_stale_auth_recovery_works_after_reopening_database(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="pr_open", extras=_metadata(source_agent="claude-code"))
+        agent_availability.mark_failure(
+            conn,
+            "codex-cli",
+            category="auth",
+            detail="agent authentication failed",
+            now=OLD,
+            source_run_id=None,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    reopened = get_connection(str(project))
+    try:
+        availability = agent_availability.get(reopened, "codex-cli")
+        assert availability is not None
+        assert availability.state == "auth_blocked"
+        assert agent_availability.is_selectable(reopened, "codex-cli", now=NOW)
+    finally:
+        reopened.close()
+
+    orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+    orch.tick("t1")
+    conn = get_connection(str(project))
+    try:
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        assert len(reviews) == 1
+        assert reviews[0].agent == "codex-cli"
+        assert reviews[0].review_target_sha == "sha-a"
+    finally:
+        conn.close()
+
+
+def test_expired_auth_block_allows_codex_mutator_when_claude_blocked(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn)
+        agent_availability.mark_failure(
+            conn,
+            "claude-code",
+            category="quota",
+            detail="quota",
+            now=NOW,
+            source_run_id=None,
+        )
+        agent_availability.mark_failure(
+            conn,
+            "codex-cli",
+            category="auth",
+            detail="agent authentication failed",
+            now=OLD,
+            source_run_id=None,
+        )
+        conn.commit()
+        LifecycleOrchestrator(str(project), now=lambda: NOW).tick("t1")
+        plans = runs_dao.list_runs_for_task(conn, "t1", kind="plan")
+        assert len(plans) == 1
+        assert plans[0].agent == "codex-cli"
     finally:
         conn.close()
 

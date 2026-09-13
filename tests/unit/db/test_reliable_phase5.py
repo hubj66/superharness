@@ -77,6 +77,12 @@ def test_classifier_uses_narrow_reliable_categories():
         == "session_limit"
     )
     assert classify_reliable(log_tail="quota exceeded").category == "quota"
+    assert (
+        classify_reliable(
+            log_tail="You've hit your usage limit, try again later"
+        ).category
+        == "quota"
+    )
     assert classify_reliable(launcher_rc=139).category == "agent_crash"
     assert classify_reliable(log_tail="connection reset by peer").category == "network"
     assert (
