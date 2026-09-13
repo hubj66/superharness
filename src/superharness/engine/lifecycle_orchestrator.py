@@ -66,6 +66,21 @@ AGENT_FAILURE_CATEGORIES = frozenset(
         "unknown",
     }
 )
+REVIEW_RETRY_CATEGORIES = frozenset(
+    {
+        "quota",
+        "session_limit",
+        "agent_crash",
+        "timeout",
+        "hang",
+        "auth",
+        "network",
+        "invalid_result",
+        "lost_process",
+        "unknown",
+    }
+)
+REVIEW_VALID_VERDICTS = frozenset({"LGTM", "REJECTED"})
 
 
 def _now_utc() -> str:
@@ -487,18 +502,26 @@ class LifecycleOrchestrator:
             return 0, 0
 
         if run.kind == "review":
+            metadata = self._pr_metadata(task)
+            current_sha = metadata.get("pr_head_sha") if metadata else None
+            if (
+                metadata
+                and run.review_target_sha
+                and current_sha != run.review_target_sha
+            ):
+                runs_dao.record_run_diagnostic(
+                    conn,
+                    run.id,
+                    failure_category="stale_review",
+                    failure_detail=(
+                        f"review_target_sha={run.review_target_sha!r}, "
+                        f"task_pr_head_sha={current_sha!r}"
+                    ),
+                )
+                return 0, 0
             if (
                 run.attempt < 2
-                and classification.category
-                in {
-                    "agent_crash",
-                    "network",
-                    "unknown",
-                    "timeout",
-                    "hang",
-                    "lost_process",
-                    "invalid_result",
-                }
+                and classification.category in REVIEW_RETRY_CATEGORIES
                 and self._agent_selectable(conn, run.agent)
                 and self._create_retry_run(conn, task, run)
             ):
@@ -590,6 +613,8 @@ class LifecycleOrchestrator:
         head_sha = failed_run.head_sha
         target_sha = failed_run.review_target_sha
         if failed_run.kind == "review" and target_sha:
+            if metadata and metadata.get("source_agent") == failed_run.agent:
+                return False
             if not metadata:
                 metadata = {
                     "branch_name": failed_run.branch_name or "",
@@ -603,7 +628,7 @@ class LifecycleOrchestrator:
                     failed_run.base_sha,
                     target_sha,
                 )
-            else:
+            elif self._is_git_repo():
                 try:
                     worktree = create_review_worktree(
                         self.project_dir,
@@ -616,6 +641,13 @@ class LifecycleOrchestrator:
                 worktree_path, branch_name, base_sha, head_sha = (
                     worktree.path,
                     None,
+                    target_sha,
+                    target_sha,
+                )
+            else:
+                worktree_path, branch_name, base_sha, head_sha = (
+                    failed_run.worktree_path,
+                    metadata["branch_name"],
                     target_sha,
                     target_sha,
                 )
@@ -827,8 +859,9 @@ class LifecycleOrchestrator:
             for run in runs_dao.list_runs_for_task(conn, task.id, kind="review")
             if run.review_target_sha == review_target_sha
         ]
-        if existing:
-            return 0, 0
+        existing_result = self._handle_same_sha_review(conn, task, existing)
+        if existing_result is not None:
+            return existing_result
         assignment = self._select_reviewer(
             conn,
             task,
@@ -869,6 +902,48 @@ class LifecycleOrchestrator:
             self._transition_task(conn, task, "review_requested")
             return 1, 1
         return 1, 0
+
+    def _handle_same_sha_review(
+        self,
+        conn,
+        task: tasks_dao.TaskRow,
+        existing: list[runs_dao.RunRow],
+    ) -> tuple[int, int] | None:
+        if not existing:
+            return None
+        if any(run.status in runs_dao.ACTIVE_RUN_STATUSES for run in existing):
+            return 0, 0
+        if any(self._review_has_consumed_verdict(run) for run in existing):
+            return 0, 0
+        latest_attempt = max(run.attempt for run in existing)
+        if latest_attempt >= 2:
+            return 0, 0
+        retry_source = max(existing, key=lambda run: (run.attempt, run.created_at))
+        if retry_source.status == "succeeded" and retry_source.failure_category not in {
+            "invalid_review_result",
+            "review_not_completed",
+        }:
+            return 0, 0
+        classification = self._classify_run_failure(retry_source)
+        if (
+            classification.category in REVIEW_RETRY_CATEGORIES
+            and self._agent_selectable(conn, retry_source.agent)
+            and self._create_retry_run(conn, task, retry_source)
+        ):
+            transition = 0
+            if task.status == "pr_open":
+                self._transition_task(conn, task, "review_requested")
+                transition = 1
+            return 1, transition
+        return 0, 0
+
+    def _review_has_consumed_verdict(self, run: runs_dao.RunRow) -> bool:
+        return (
+            run.status == "succeeded"
+            and run.orchestrator_consumed_at is not None
+            and run.review_verdict in REVIEW_VALID_VERDICTS
+            and not run.failure_category
+        )
 
     def _consume_review_result(
         self,

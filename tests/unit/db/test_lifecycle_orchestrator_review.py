@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from superharness.engine import inbox_dao, runs_dao, tasks_dao
+from superharness.engine import agent_availability, inbox_dao, runs_dao, tasks_dao
 from superharness.engine.db import get_connection, init_db
 from superharness.engine.lifecycle_orchestrator import LifecycleOrchestrator
 from superharness.engine.shipper import ShipOutcome
 
 NOW = "2026-01-01T00:00:00Z"
+LATER = "2026-01-01T02:00:00Z"
 
 
 class FakeShipper:
@@ -29,7 +30,7 @@ def _project(tmp_path: Path):
     return project, conn
 
 
-def _metadata(sha: str = "sha-a") -> str:
+def _metadata(sha: str = "sha-a", *, source_agent: str = "claude-code") -> str:
     return json.dumps(
         {
             "reliable_orchestrator": {
@@ -41,12 +42,19 @@ def _metadata(sha: str = "sha-a") -> str:
                 "pr_number": 42,
                 "pr_url": "https://github.com/o/r/pull/42",
                 "ship_run_id": "ship-1",
+                "source_agent": source_agent,
             }
         }
     )
 
 
-def _task(conn, *, status: str = "pr_open", sha: str = "sha-a") -> None:
+def _task(
+    conn,
+    *,
+    status: str = "pr_open",
+    sha: str = "sha-a",
+    source_agent: str = "claude-code",
+) -> None:
     conn.execute(
         """
         INSERT INTO tasks (
@@ -63,7 +71,7 @@ def _task(conn, *, status: str = "pr_open", sha: str = "sha-a") -> None:
             "reliable-orchestrator",
             json.dumps(["checkout succeeds", "tests pass"]),
             "Original durable task context.",
-            _metadata(sha),
+            _metadata(sha, source_agent=source_agent),
         ),
     )
     conn.commit()
@@ -94,6 +102,29 @@ def _complete_review(
         payload["reviewed_sha"] = sha
     runs_dao.record_run_result(conn, run.id, payload, now=NOW)
     runs_dao.transition_run(conn, run.id, to_status="succeeded", now=NOW)
+    conn.commit()
+
+
+def _fail_review(
+    conn,
+    run: runs_dao.RunRow,
+    *,
+    category: str = "network",
+    status: str = "failed",
+) -> None:
+    if run.status == "queued":
+        runs_dao.transition_run(conn, run.id, to_status="claimed", now=NOW)
+    run = runs_dao.get_run(conn, run.id) or run
+    if run.status == "claimed":
+        runs_dao.transition_run(conn, run.id, to_status="running", now=NOW)
+    runs_dao.transition_run(
+        conn,
+        run.id,
+        to_status=status,
+        now=NOW,
+        failure_category=category,
+        failure_detail=category,
+    )
     conn.commit()
 
 
@@ -152,6 +183,21 @@ def test_pr_open_creates_one_codex_review_for_exact_sha(tmp_path):
         conn.close()
 
 
+def test_active_review_for_current_sha_does_not_duplicate(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        orch.tick("t1")
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        assert len(reviews) == 1
+        assert reviews[0].status == "queued"
+        assert reviews[0].review_target_sha == "sha-a"
+    finally:
+        conn.close()
+
+
 def test_lgtm_for_current_sha_moves_to_review_passed_only(tmp_path):
     project, conn = _project(tmp_path)
     try:
@@ -168,6 +214,143 @@ def test_lgtm_for_current_sha_moves_to_review_passed_only(tmp_path):
         assert len(runs_dao.list_runs_for_task(conn, "t1", kind="ship")) == 0
         metadata = json.loads(task.extras_json)["reliable_orchestrator"]
         assert metadata["last_reviewed_head_sha"] == "sha-a"
+    finally:
+        conn.close()
+
+
+def test_successful_consumed_review_for_current_sha_does_not_duplicate(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        review = runs_dao.list_runs_for_task(conn, "t1", kind="review")[0]
+        _complete_review(conn, review, verdict="LGTM", sha="sha-a")
+        orch.tick("t1")
+        orch.tick("t1")
+        assert len(runs_dao.list_runs_for_task(conn, "t1", kind="review")) == 1
+        assert tasks_dao.get(conn, "t1").status == "review_passed"
+    finally:
+        conn.close()
+
+
+def test_failed_current_sha_review_retries_once_when_reviewer_selectable(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        review = runs_dao.list_runs_for_task(conn, "t1", kind="review")[0]
+        _fail_review(conn, review, category="network")
+        orch.tick("t1")
+        orch.tick("t1")
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        retry = max(reviews, key=lambda run: run.attempt)
+        assert len(reviews) == 2
+        assert retry.attempt == 2
+        assert retry.trigger_run_id == review.id
+        assert retry.review_target_sha == "sha-a"
+        assert retry.agent == "codex-cli"
+        assert tasks_dao.get(conn, "t1").status == "review_requested"
+    finally:
+        conn.close()
+
+
+def test_auth_blocked_review_waits_then_recovers_once(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        review = runs_dao.list_runs_for_task(conn, "t1", kind="review")[0]
+        _fail_review(conn, review, category="auth")
+        orch.tick("t1")
+        assert len(runs_dao.list_runs_for_task(conn, "t1", kind="review")) == 1
+        availability = agent_availability.get(conn, "codex-cli")
+        assert availability is not None and availability.state == "auth_blocked"
+
+        recovered = LifecycleOrchestrator(str(project), now=lambda: LATER)
+        recovered.tick("t1")
+        recovered.tick("t1")
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        retry = max(reviews, key=lambda run: run.attempt)
+        assert len(reviews) == 2
+        assert retry.attempt == 2
+        assert retry.review_target_sha == "sha-a"
+        assert retry.status == "queued"
+    finally:
+        conn.close()
+
+
+def test_review_retry_bound_prevents_third_attempt(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        review = runs_dao.list_runs_for_task(conn, "t1", kind="review")[0]
+        _fail_review(conn, review, category="network")
+        orch.tick("t1")
+        retry = max(
+            runs_dao.list_runs_for_task(conn, "t1", kind="review"),
+            key=lambda run: run.attempt,
+        )
+        _fail_review(conn, retry, category="network")
+        orch.tick("t1")
+        assert len(runs_dao.list_runs_for_task(conn, "t1", kind="review")) == 2
+    finally:
+        conn.close()
+
+
+def test_stale_failed_review_does_not_block_current_sha_review(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, sha="sha-b")
+        stale = runs_dao.create_run(
+            conn,
+            id="review-sha-a",
+            task_id="t1",
+            kind="review",
+            agent="codex-cli",
+            model="gpt-5.5",
+            dedupe_key="review:t1:sha-a",
+            review_target_sha="sha-a",
+            result_json={"prompt": "old review"},
+            now=NOW,
+        )
+        _fail_review(conn, stale, category="network")
+        LifecycleOrchestrator(str(project), now=lambda: NOW).tick("t1")
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        assert len(reviews) == 2
+        assert {run.review_target_sha for run in reviews} == {"sha-a", "sha-b"}
+        current = next(run for run in reviews if run.review_target_sha == "sha-b")
+        assert current.status == "queued"
+    finally:
+        conn.close()
+
+
+def test_review_retry_does_not_self_review_sha_producer(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, source_agent="codex-cli")
+        bad_review = runs_dao.create_run(
+            conn,
+            id="self-review",
+            task_id="t1",
+            kind="review",
+            agent="codex-cli",
+            model="gpt-5.5",
+            dedupe_key="review:t1:sha-a",
+            review_target_sha="sha-a",
+            result_json={"prompt": "bad historical self review"},
+            now=NOW,
+        )
+        _fail_review(conn, bad_review, category="network")
+        LifecycleOrchestrator(str(project), now=lambda: NOW).tick("t1")
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        assert len(reviews) == 1
+        assert reviews[0].agent == "codex-cli"
+        assert tasks_dao.get(conn, "t1").status == "pr_open"
     finally:
         conn.close()
 
