@@ -19,4 +19,10 @@ class CodexHarness:
     def build_invocation(
         self, task: dict, project_dir: str, non_interactive: bool
     ) -> Invocation:
-        return build_generic_invocation(self.name, task, project_dir, non_interactive)
+        return build_generic_invocation(
+            self.name,
+            task,
+            project_dir,
+            non_interactive,
+            prefix_model=False,
+        )

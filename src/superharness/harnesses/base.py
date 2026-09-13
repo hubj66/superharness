@@ -38,9 +38,7 @@ class Harness(Protocol):
         self, task: dict, project_dir: str, non_interactive: bool
     ) -> Invocation: ...
 
-    def discover_models(
-        self, auth_mode: str = "unknown"
-    ) -> list["DiscoveredModel"]:
+    def discover_models(self, auth_mode: str = "unknown") -> list[DiscoveredModel]:
         """Return models available on this host for the given auth mode.
 
         Iteration 1 of PLAN-dynamic-model-selection.md: the default is a
@@ -63,7 +61,7 @@ def _base_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
 
 def discover_via_probe(
     agent: str, auth_mode: str = "unknown", budget_seconds: float = 5.0
-) -> list["DiscoveredModel"]:
+) -> list[DiscoveredModel]:
     """Probe-based discovery for agents without a native model-list command.
 
     Iteration 6 of PLAN-dynamic-model-selection.md: builds the accept chain
@@ -71,7 +69,10 @@ def discover_via_probe(
     ProbeDiscovery pass over it.  Returns [] when the manifest can't be
     loaded or the chain is empty — never raises.
     """
-    from superharness.engine.adapter_registry import AdapterValidationError, load_manifest
+    from superharness.engine.adapter_registry import (
+        AdapterValidationError,
+        load_manifest,
+    )
     from superharness.engine.probe_discovery import ProbeDiscovery
 
     try:
@@ -91,15 +92,22 @@ def discover_via_probe(
 
 
 def build_generic_invocation(
-    name: str, task: dict, project_dir: str, non_interactive: bool
+    name: str,
+    task: dict,
+    project_dir: str,
+    non_interactive: bool,
+    *,
+    prefix_model: bool = True,
 ) -> Invocation:
     """Shared argv assembly for adapters that wrap a bash launcher with
     --project/--prompt/--non-interactive/--yolo/--codex-bypass/--model/
-    --effort flags and apply provider/model prefixing
+    --effort flags. By default, provider/model prefixing is applied
     (codex-cli, gemini-cli, opencode).
 
     claude-code is deliberately NOT built via this helper — Claude CLI
     rejects the anthropic/ prefix, so ClaudeHarness never prefixes its model.
+    Codex CLI with ChatGPT auth also rejects provider-prefixed model names,
+    so CodexHarness opts out with prefix_model=False.
     """
     from pathlib import Path
 
@@ -111,7 +119,7 @@ def build_generic_invocation(
 
     prompt = str(task.get("prompt", ""))
     model = str(task.get("model") or "")
-    if model:
+    if model and prefix_model:
         model = apply_model_prefix(model)
     effort = str(task.get("effort") or "")
     yolo = bool(task.get("yolo", False))

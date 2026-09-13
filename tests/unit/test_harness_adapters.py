@@ -14,15 +14,14 @@ claude-code.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import pytest
 
-from superharness.harnesses import KNOWN_HARNESSES, get_harness
-from superharness.engine.adapter_registry import resolve_launcher
 import superharness
-
+from superharness.engine.adapter_registry import resolve_launcher
+from superharness.harnesses import KNOWN_HARNESSES, get_harness
 
 _REQUIRES_POSIX_FIXTURE = pytest.mark.skipif(
     os.name != "posix",
@@ -37,7 +36,7 @@ def _scripts_dir() -> str:
 def test_codex_invocation_parity():
     launcher = resolve_launcher("codex-cli", _scripts_dir())
     invocation = get_harness("codex-cli").build_invocation(
-        task={"prompt": "do the thing", "model": "gpt-5-codex", "effort": "high"},
+        task={"prompt": "do the thing", "model": "gpt-5.5", "effort": "high"},
         project_dir="/tmp/proj",
         non_interactive=True,
     )
@@ -50,11 +49,29 @@ def test_codex_invocation_parity():
         "do the thing",
         "--non-interactive",
         "--model",
-        "openai/gpt-5-codex",
+        "gpt-5.5",
         "--effort",
         "high",
     )
     assert invocation.cwd == "/tmp/proj"
+    assert "openai/gpt-5.5" not in invocation.argv
+
+
+def test_codex_invocation_keeps_yolo_bypass_and_non_interactive_flags():
+    invocation = get_harness("codex-cli").build_invocation(
+        task={
+            "prompt": "do the thing",
+            "model": "gpt-5.5",
+            "yolo": True,
+            "codex_bypass": True,
+        },
+        project_dir="/tmp/proj",
+        non_interactive=True,
+    )
+    assert "--non-interactive" in invocation.argv
+    assert "--yolo" in invocation.argv
+    assert "--codex-bypass" in invocation.argv
+    assert invocation.argv[invocation.argv.index("--model") + 1] == "gpt-5.5"
 
 
 def test_gemini_invocation_parity():
@@ -97,6 +114,16 @@ def test_opencode_invocation_parity():
         "anthropic/claude-sonnet-4-6",
     )
     assert invocation.cwd == "/tmp/proj"
+
+
+def test_opencode_still_prefixes_openai_model():
+    invocation = get_harness("opencode").build_invocation(
+        task={"prompt": "do the thing", "model": "gpt-5.5"},
+        project_dir="/tmp/proj",
+        non_interactive=True,
+    )
+    assert "--model" in invocation.argv
+    assert invocation.argv[invocation.argv.index("--model") + 1] == "openai/gpt-5.5"
 
 
 def test_pi_invocation_parity():
@@ -145,13 +172,25 @@ def test_pi_model_discovery_parses_list_output(monkeypatch: pytest.MonkeyPatch):
 
     models = PiHarness().discover_models(auth_mode="apikey")
 
-    assert [model.id for model in models] == ["provider-a/model-a", "provider-b/model-b"]
+    assert [model.id for model in models] == [
+        "provider-a/model-a",
+        "provider-b/model-b",
+    ]
     assert all(model.source == "native" for model in models)
     assert all(model.auth_mode == "apikey" for model in models)
-    assert calls == [(
-        ("pi", "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates", "--list-models"),
-        {"capture_output": True, "text": True, "timeout": 10, "check": False},
-    )]
+    assert calls == [
+        (
+            (
+                "pi",
+                "--offline",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--list-models",
+            ),
+            {"capture_output": True, "text": True, "timeout": 10, "check": False},
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -159,11 +198,45 @@ def test_pi_model_discovery_parses_list_output(monkeypatch: pytest.MonkeyPatch):
     [
         FileNotFoundError("pi not found"),
         subprocess.TimeoutExpired(cmd="pi", timeout=10),
-        type("Nonzero", (), {"returncode": 1, "stdout": "provider model context max-out thinking images\nprovider-a model-a 1M 384K yes no\n", "stderr": ""})(),
-        type("Junk", (), {"returncode": 0, "stdout": "not a model table", "stderr": ""})(),
-        type("MissingHeader", (), {"returncode": 0, "stdout": "provider-a model-a 1M 384K yes no", "stderr": ""})(),
-        type("ZeroRows", (), {"returncode": 0, "stdout": "provider model context max-out thinking images\n", "stderr": ""})(),
-        type("SplitStreams", (), {"returncode": 0, "stdout": "provider model context max-out thinking images\n", "stderr": "provider-a model-a 1M 384K yes no\n"})(),
+        type(
+            "Nonzero",
+            (),
+            {
+                "returncode": 1,
+                "stdout": "provider model context max-out thinking images\nprovider-a model-a 1M 384K yes no\n",
+                "stderr": "",
+            },
+        )(),
+        type(
+            "Junk", (), {"returncode": 0, "stdout": "not a model table", "stderr": ""}
+        )(),
+        type(
+            "MissingHeader",
+            (),
+            {
+                "returncode": 0,
+                "stdout": "provider-a model-a 1M 384K yes no",
+                "stderr": "",
+            },
+        )(),
+        type(
+            "ZeroRows",
+            (),
+            {
+                "returncode": 0,
+                "stdout": "provider model context max-out thinking images\n",
+                "stderr": "",
+            },
+        )(),
+        type(
+            "SplitStreams",
+            (),
+            {
+                "returncode": 0,
+                "stdout": "provider model context max-out thinking images\n",
+                "stderr": "provider-a model-a 1M 384K yes no\n",
+            },
+        )(),
     ],
 )
 def test_pi_model_discovery_never_raises(
