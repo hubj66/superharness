@@ -279,7 +279,10 @@ def test_auth_block_cooldown_refresh_and_success_recovery(db_conn):
 
 def test_selector_prefers_claude_then_codex_and_honors_blocks(db_conn):
     selector = AgentSelector({})
-    assert selector.select_mutator(db_conn, now=NOW).agent == "claude-code"
+    assignment = selector.select_mutator(db_conn, now=NOW)
+    assert assignment is not None
+    assert assignment.agent == "claude-code"
+    assert assignment.model == "claude-sonnet-4-6"
     agent_availability.mark_failure(
         db_conn,
         "claude-code",
@@ -633,3 +636,77 @@ def test_v41_to_v42_availability_migration_is_additive_and_idempotent():
         "SELECT name FROM sqlite_master WHERE name='agent_availability'"
     ).fetchone()
     conn.close()
+
+
+def test_plan_uses_managed_worktree(tmp_path, monkeypatch):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn)
+
+        class FakeWorktree:
+            path = "/tmp/superharness-worktrees/reliable/project/shux-reliable-t1"
+            branch_name = "shux/reliable/t1"
+            base_sha = "origin-main-sha"
+
+        monkeypatch.setattr(
+            LifecycleOrchestrator,
+            "_is_git_repo",
+            lambda self: True,
+        )
+        monkeypatch.setattr(
+            "superharness.engine.lifecycle_orchestrator.create_managed_worktree",
+            lambda project_dir, task_id: FakeWorktree(),
+        )
+
+        LifecycleOrchestrator(str(project), now=lambda: NOW).tick("t1")
+
+        plans = runs_dao.list_runs_for_task(conn, "t1", kind="plan")
+        assert len(plans) == 1
+        assert plans[0].worktree_path == FakeWorktree.path
+        assert plans[0].branch_name == FakeWorktree.branch_name
+        assert plans[0].base_sha == FakeWorktree.base_sha
+        assert plans[0].model == "claude-sonnet-4-6"
+    finally:
+        conn.close()
+
+
+def test_failed_consumed_plan_retries_once(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn)
+
+        failed = runs_dao.create_run(
+            conn,
+            id="plan-failed-1",
+            task_id="t1",
+            kind="plan",
+            agent="claude-code",
+            model=None,
+            attempt=1,
+            dedupe_key="plan:t1",
+            now=NOW,
+        )
+        _finish_run(
+            conn,
+            failed,
+            status="failed",
+            failure_category="unknown",
+            failure_detail="missing persisted model",
+        )
+        runs_dao.mark_run_consumed(conn, failed.id, now=NOW)
+        conn.commit()
+
+        LifecycleOrchestrator(str(project), now=lambda: NOW).tick("t1")
+
+        plans = runs_dao.list_runs_for_task(conn, "t1", kind="plan")
+        assert len(plans) == 2
+
+        retry = max(plans, key=lambda run: run.attempt)
+        assert retry.attempt == 2
+        assert retry.parent_run_id == failed.id
+        assert retry.trigger_run_id == failed.id
+        assert retry.agent == "claude-code"
+        assert retry.model == "claude-sonnet-4-6"
+        assert retry.status == "queued"
+    finally:
+        conn.close()

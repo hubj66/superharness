@@ -9,6 +9,7 @@ from superharness.engine import agent_availability
 CLAUDE_AGENT = "claude-code"
 CODEX_AGENT = "codex-cli"
 DEFAULT_CODEX_MODEL = "gpt-5.5"
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 
 
 @dataclass(frozen=True)
@@ -112,10 +113,11 @@ class AgentSelector:
                 or DEFAULT_CODEX_MODEL
             )
         if agent == CLAUDE_AGENT:
-            raw = self.profile.get("claude_model") or self.profile.get(
-                "claude_code_model"
+            return str(
+                self.profile.get("claude_model")
+                or self.profile.get("claude_code_model")
+                or DEFAULT_CLAUDE_MODEL
             )
-            return str(raw) if raw else None
         return None
 
 

@@ -160,7 +160,33 @@ class LifecycleOrchestrator:
                         existing = runs_dao.list_runs_for_task(
                             conn, task.id, kind="plan"
                         )
-                        if not existing:
+                        retry_source = (
+                            max(existing, key=lambda run: (run.attempt, run.created_at))
+                            if existing
+                            else None
+                        )
+                        should_create = not existing
+                        attempt = 1
+                        parent_run_id = None
+                        trigger_run_id = None
+                        dedupe_key = f"plan:{task.id}"
+
+                        if (
+                            retry_source is not None
+                            and retry_source.status not in runs_dao.ACTIVE_RUN_STATUSES
+                            and retry_source.status != "succeeded"
+                            and retry_source.orchestrator_consumed_at is not None
+                            and retry_source.attempt < 2
+                        ):
+                            should_create = True
+                            attempt = retry_source.attempt + 1
+                            parent_run_id = retry_source.id
+                            trigger_run_id = retry_source.id
+                            dedupe_key = (
+                                f"retry:{task.id}:plan:{retry_source.id}:{attempt}"
+                            )
+
+                        if should_create:
                             assignment = self._select_mutator(conn, task)
                             if assignment is None:
                                 continue
@@ -168,9 +194,12 @@ class LifecycleOrchestrator:
                                 conn,
                                 task,
                                 kind="plan",
-                                dedupe_key=f"plan:{task.id}",
+                                dedupe_key=dedupe_key,
                                 agent=assignment.agent,
                                 model=assignment.model,
+                                parent_run_id=parent_run_id,
+                                trigger_run_id=trigger_run_id,
+                                attempt=attempt,
                             )
                             result = TickResult(
                                 inspected=result.inspected,
@@ -1045,7 +1074,11 @@ class LifecycleOrchestrator:
     ) -> runs_dao.RunRow:
         agent = agent or self._agent_for(task)
         worktree = None
-        if kind == "implement" and self._is_git_repo() and worktree_path is None:
+        if (
+            kind in {"plan", "implement"}
+            and self._is_git_repo()
+            and worktree_path is None
+        ):
             worktree = create_managed_worktree(self.project_dir, task.id)
             worktree_path = worktree.path
             branch_name = worktree.branch_name
