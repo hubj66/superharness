@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
 from superharness.engine import runs_dao, tasks_dao
+from superharness.engine.lifecycle_orchestrator import LifecycleOrchestrator
 from superharness.engine.db import get_connection, init_db
 from superharness.engine.reliable_worktree import (
     create_managed_worktree,
     create_repair_worktree,
     create_review_worktree,
     reliable_task_branch,
+    _is_clean,
 )
 from superharness.engine.shipper import CommandResult, SystemShipper
 
@@ -288,6 +291,86 @@ def test_review_worktree_is_detached_at_exact_remote_pr_sha(tmp_path):
     assert _run(review_path, "rev-parse", "HEAD") == pr_head
     assert _run(review_path, "branch", "--show-current") == ""
     assert base_sha != pr_head
+
+
+def test_missing_registered_review_worktree_is_recreated_at_exact_sha(tmp_path):
+    project, worktree, branch, _base_sha = _shipping_fixture(tmp_path)
+    (worktree / "README.md").write_text("changed\n", encoding="utf-8")
+    _run(worktree, "add", "README.md")
+    _run(worktree, "commit", "-m", "change")
+    pr_head = _run(worktree, "rev-parse", "HEAD")
+    _run(worktree, "push", "origin", f"{branch}:{branch}")
+
+    review = create_review_worktree(
+        str(project), "t1", branch_name=branch, review_target_sha=pr_head
+    )
+    review_path = Path(review.path)
+    shutil.rmtree(review_path)
+    assert not review_path.exists()
+
+    recreated = create_review_worktree(
+        str(project), "t1", branch_name=branch, review_target_sha=pr_head
+    )
+
+    assert Path(recreated.path) == review_path
+    assert recreated.base_sha == pr_head
+    assert recreated.branch_name is None
+    assert _run(review_path, "rev-parse", "HEAD") == pr_head
+    assert _run(review_path, "branch", "--show-current") == ""
+
+
+def test_dirty_existing_review_worktree_is_restored_at_exact_sha(tmp_path):
+    project, worktree, branch, _base_sha = _shipping_fixture(tmp_path)
+    (worktree / "README.md").write_text("changed\n", encoding="utf-8")
+    _run(worktree, "add", "README.md")
+    _run(worktree, "commit", "-m", "change")
+    pr_head = _run(worktree, "rev-parse", "HEAD")
+    _run(worktree, "push", "origin", f"{branch}:{branch}")
+
+    review = create_review_worktree(
+        str(project), "t1", branch_name=branch, review_target_sha=pr_head
+    )
+    review_path = Path(review.path)
+    (review_path / "README.md").write_text("dirty tracked content\n", encoding="utf-8")
+    (review_path / "untracked-review-input.txt").write_text(
+        "must not be reviewed\n", encoding="utf-8"
+    )
+
+    restored = create_review_worktree(
+        str(project), "t1", branch_name=branch, review_target_sha=pr_head
+    )
+
+    assert Path(restored.path) == review_path
+    assert (review_path / "README.md").read_text(encoding="utf-8") == "changed\n"
+    assert not (review_path / "untracked-review-input.txt").exists()
+    assert _run(review_path, "rev-parse", "HEAD") == pr_head
+    assert _is_clean(str(review_path))
+    assert _run(review_path, "branch", "--show-current") == ""
+
+    orchestrator = LifecycleOrchestrator(str(project))
+    assert orchestrator._safe_review_worktree(str(review_path), pr_head) is True
+
+
+def test_attached_existing_review_worktree_is_not_safe_to_reuse(tmp_path):
+    project, worktree, branch, _base_sha = _shipping_fixture(tmp_path)
+    (worktree / "README.md").write_text("changed\n", encoding="utf-8")
+    _run(worktree, "add", "README.md")
+    _run(worktree, "commit", "-m", "change")
+    pr_head = _run(worktree, "rev-parse", "HEAD")
+    _run(worktree, "push", "origin", f"{branch}:{branch}")
+
+    review = create_review_worktree(
+        str(project), "t1", branch_name=branch, review_target_sha=pr_head
+    )
+    review_path = Path(review.path)
+    _run(review_path, "switch", "-c", "review-attached")
+    assert _run(review_path, "rev-parse", "HEAD") == pr_head
+    assert _is_clean(str(review_path))
+    assert _run(review_path, "branch", "--show-current") == "review-attached"
+
+    orchestrator = LifecycleOrchestrator(str(project))
+
+    assert orchestrator._safe_review_worktree(str(review_path), pr_head) is False
 
 
 def test_repair_worktree_resets_same_task_branch_to_current_remote_head(tmp_path):

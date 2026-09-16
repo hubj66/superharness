@@ -68,6 +68,9 @@ def escalate_stale_reviews(project_dir: str, timeout_minutes: int | None = None)
         return 0
 
     from superharness.engine import state_reader
+    from superharness.engine.reliable_orchestrator_gate import (
+        is_reliable_orchestrated_task,
+    )
 
     try:
         tasks = state_reader.get_tasks(project_dir)
@@ -81,6 +84,9 @@ def escalate_stale_reviews(project_dir: str, timeout_minutes: int | None = None)
         if not isinstance(task, dict):
             continue
         if task.get("status") != "review_requested":
+            continue
+        # Reliable tasks are owned exclusively by LifecycleOrchestrator.
+        if is_reliable_orchestrated_task(task):
             continue
         # Skip already-escalated tasks
         if task.get("escalated_to"):

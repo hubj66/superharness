@@ -529,7 +529,11 @@ def _run_reliable_delegate(
     agent: str = "claude-code",
     extra_args: list[str] | None = None,
 ):
-    env = {"SUPERHARNESS_RUN_ID": run_id} if run_id else None
+    env = (
+        {"SUPERHARNESS_RUN_ID": run_id, "SUPERHARNESS_RUN_RESULT_PATH": str(project / "artifact.json")}
+        if run_id
+        else None
+    )
     return _run_delegate_py(
         project,
         args=[
@@ -763,6 +767,15 @@ def test_reliable_prompt_does_not_delegate_lifecycle_or_shipping(
     assert "shux contract` to update task status" not in result.stdout
     assert "Run `shux task status" not in result.stdout
     assert "ALLOW_PUSH=1 /ship commit" not in result.stdout
+    for field in ("schema_version", "run_id", "task_id", "kind", "agent", "exit_code", "completion_status"):
+        assert field in result.stdout
+    assert f"Set kind exactly to {run_kind}" in result.stdout
+    assert f"Set agent exactly to {agent}" in result.stdout
+    assert "completion_status must be one of" in result.stdout
+    assert "Do not use custom fields such as status" in result.stdout
+    if run_kind != "review":
+        for field in ("worktree_path", "branch_name", "base_sha", "head_sha", "dirty"):
+            assert field in result.stdout
 
 
 def test_reliable_review_prompt_is_read_only_and_sha_bound(tmp_path):
@@ -776,6 +789,14 @@ def test_reliable_review_prompt_is_read_only_and_sha_bound(tmp_path):
     assert "Review only" in result.stdout
     assert "sha-review" in result.stdout
     assert "Do not modify any file or task" in result.stdout
+    assert "Structured result contract:" in result.stdout
+    assert "Write exactly one JSON object to" in result.stdout
+    assert "reviewed_sha" in result.stdout
+    assert "review_verdict must be LGTM or REJECTED" in result.stdout
+    assert "Set reviewed_sha exactly to sha-review" in result.stdout
+    assert "findings" in result.stdout
+    assert str(project / "artifact.json") in result.stdout
+    assert "BLOCKED" not in result.stdout
 
 
 @pytest.mark.parametrize("requested_status", ["plan_proposed", "done"])

@@ -144,11 +144,17 @@ def create_review_worktree(
     )
     os.makedirs(root, exist_ok=True)
     if os.path.isdir(path):
+        if not is_managed_worktree_path(project_dir, path):
+            raise StateError(f"Refusing to clean unmanaged review worktree: {path!r}")
         head = rev_parse(path, "HEAD")
         if head != review_target_sha:
             raise StateError(
                 f"Review worktree {path!r} is at {head}, not {review_target_sha}"
             )
+        if not _is_clean(path):
+            _run_git(path, "reset", "--hard", review_target_sha)
+            _run_git(path, "clean", "-fdx")
+        verify_review_worktree(path, review_target_sha)
         _link_superharness_state(project_dir, path)
         return ManagedWorktree(path=path, branch_name=None, base_sha=review_target_sha)
     result = _run_git(
@@ -160,8 +166,22 @@ def create_review_worktree(
         review_target_sha,
         check=False,
     )
+    if result.returncode != 0 and _is_missing_registered_worktree_error(
+        result.stderr
+    ):
+        result = _run_git(
+            project_dir,
+            "worktree",
+            "add",
+            "-f",
+            "--detach",
+            path,
+            review_target_sha,
+            check=False,
+        )
     if result.returncode != 0:
         raise StateError(result.stderr.strip() or "git review worktree add failed")
+    verify_review_worktree(path, review_target_sha)
     _link_superharness_state(project_dir, path)
     return ManagedWorktree(path=path, branch_name=None, base_sha=review_target_sha)
 
@@ -233,6 +253,26 @@ def ref_exists(project_dir: str, ref: str) -> bool:
 def _worktree_name(task_id: str) -> str:
     safe = sanitize_task_id(task_id).strip(".-/") or "task"
     return _SAFE_BRANCH_RE.sub("-", safe).replace("/", "-")[:80]
+
+
+def _is_missing_registered_worktree_error(stderr: str) -> bool:
+    text = stderr.lower()
+    return "missing but already registered worktree" in text
+
+
+def verify_review_worktree(path: str, review_target_sha: str) -> None:
+    head = rev_parse(path, "HEAD")
+    if head != review_target_sha:
+        raise StateError(
+            f"Review worktree {path!r} is at {head}, not {review_target_sha}"
+        )
+    if not _is_clean(path):
+        raise StateError(f"Review worktree {path!r} is not clean")
+    if (
+        _run_git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False).returncode
+        == 0
+    ):
+        raise StateError(f"Review worktree {path!r} is not detached")
 
 
 def _is_clean(project_dir: str) -> bool:

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 from superharness.engine import agent_availability, inbox_dao, runs_dao, tasks_dao
 from superharness.engine.db import get_connection, init_db
 from superharness.engine.lifecycle_orchestrator import LifecycleOrchestrator
+from superharness.engine.state_errors import StateError
 from superharness.engine.shipper import ShipOutcome
 
 NOW = "2026-01-01T00:00:00Z"
 LATER = "2026-01-01T02:00:00Z"
+R6_SHA = "55ca1b066c9956a743d0bb3aa951a540ef41f819"
 
 
 class FakeShipper:
@@ -282,6 +285,109 @@ def test_auth_blocked_review_waits_then_recovers_once(tmp_path):
         conn.close()
 
 
+def test_consumed_auth_review_with_missing_recorded_worktree_recreates_attempt_2(
+    tmp_path, monkeypatch
+):
+    project, conn = _project(tmp_path)
+    stale_registered = {"value": True}
+    managed_root = tmp_path / "managed-worktrees"
+    worktree = managed_root / f"review-t1-{R6_SHA[:12]}"
+
+    def fake_git(project_dir, *args, check=True):
+        if project_dir == str(worktree) and args == ("rev-parse", "HEAD"):
+            if stale_registered["value"]:
+                raise StateError("missing review worktree")
+            return subprocess.CompletedProcess(["git", *args], 0, R6_SHA + "\n", "")
+        if project_dir == str(worktree) and args == (
+            "status", "--porcelain=v1", "--untracked-files=normal"
+        ):
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+        if project_dir == str(worktree) and args == (
+            "symbolic-ref", "--quiet", "--short", "HEAD"
+        ):
+            return subprocess.CompletedProcess(["git", *args], 1, "", "")
+        assert project_dir == str(project)
+        if args == ("fetch", "origin", "shux/reliable/t1"):
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+        if args == (
+            "rev-parse",
+            "refs/remotes/origin/shux/reliable/t1^{commit}",
+        ):
+            return subprocess.CompletedProcess(["git", *args], 0, R6_SHA + "\n", "")
+        if args == ("worktree", "list", "--porcelain"):
+            stdout = f"worktree {project}\n\nworktree {worktree}\n"
+            return subprocess.CompletedProcess(["git", *args], 0, stdout, "")
+        if args == ("worktree", "add", "--detach", str(worktree), R6_SHA):
+            if stale_registered["value"]:
+                return subprocess.CompletedProcess(
+                    ["git", *args],
+                    128,
+                    "",
+                    "missing but already registered worktree",
+                )
+            worktree.mkdir(parents=True)
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+        if args == ("worktree", "add", "-f", "--detach", str(worktree), R6_SHA):
+            stale_registered["value"] = False
+            worktree.mkdir(parents=True)
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+        raise AssertionError(args)
+
+    try:
+        (project / ".git").mkdir()
+        monkeypatch.setenv("SUPERHARNESS_WORKTREE_ROOT", str(managed_root))
+        monkeypatch.setattr("superharness.engine.reliable_worktree._run_git", fake_git)
+        _task(conn, status="review_requested", sha=R6_SHA)
+        review = runs_dao.create_run(
+            conn,
+            id="run-a75e27df71191f81020a0e40",
+            task_id="t1",
+            kind="review",
+            agent="codex-cli",
+            model="gpt-5.5",
+            dedupe_key=f"review:t1:{R6_SHA}",
+            review_target_sha=R6_SHA,
+            result_json={"prompt": "original review"},
+            worktree_path=str(worktree),
+            branch_name="shux/reliable/t1",
+            base_sha=R6_SHA,
+            head_sha=R6_SHA,
+            pr_number=2,
+            pr_url="https://github.com/o/r/pull/2",
+            now=NOW,
+        )
+        assert not worktree.exists()
+        _fail_review(conn, review, category="auth")
+
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        consumed = runs_dao.get_run(conn, review.id)
+        assert consumed is not None and consumed.orchestrator_consumed_at is not None
+        availability = agent_availability.get(conn, "codex-cli")
+        assert availability is not None and availability.state == "auth_blocked"
+        assert len(runs_dao.list_runs_for_task(conn, "t1", kind="review")) == 1
+
+        recovered = LifecycleOrchestrator(str(project), now=lambda: LATER)
+        recovered.tick("t1")
+        recovered.tick("t1")
+
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        retry = max(reviews, key=lambda run: run.attempt)
+        active = [run for run in reviews if run.status in runs_dao.ACTIVE_RUN_STATUSES]
+        assert len(reviews) == 2
+        assert len(active) == 1
+        assert retry.agent == "codex-cli"
+        assert retry.attempt == 2
+        assert retry.trigger_run_id == review.id
+        assert retry.review_target_sha == R6_SHA
+        assert retry.worktree_path == str(worktree)
+        assert retry.base_sha == R6_SHA
+        assert retry.head_sha == R6_SHA
+        assert tasks_dao.get(conn, "t1").status == "review_requested"
+    finally:
+        conn.close()
+
+
 def test_review_retry_bound_prevents_third_attempt(tmp_path):
     project, conn = _project(tmp_path)
     try:
@@ -455,11 +561,33 @@ def test_blocked_or_invalid_review_result_does_not_advance(tmp_path):
         orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
         orch.tick("t1")
         review = runs_dao.list_runs_for_task(conn, "t1", kind="review")[0]
-        _complete_review(conn, review, verdict="BLOCKED", sha="sha-a")
+        runs_dao.transition_run(conn, review.id, to_status="claimed", now=NOW)
+        runs_dao.transition_run(conn, review.id, to_status="running", now=NOW)
+        conn.execute(
+            "UPDATE runs SET result_json=?, exit_code=0 WHERE id=?",
+            (
+                json.dumps({
+                    "schema_version": 1,
+                    "run_id": review.id,
+                    "task_id": "t1",
+                    "kind": "review",
+                    "agent": review.agent,
+                    "exit_code": 0,
+                    "completion_status": "completed",
+                    "review_verdict": "BLOCKED",
+                    "reviewed_sha": "sha-a",
+                }),
+                review.id,
+            ),
+        )
+        runs_dao.transition_run(conn, review.id, to_status="succeeded", now=NOW)
+        conn.commit()
         orch.tick("t1")
         task = tasks_dao.get(conn, "t1")
         assert task is not None and task.status == "review_requested"
-        assert runs_dao.get_run(conn, review.id).failure_category == "review_blocked"
+        assert runs_dao.get_run(conn, review.id).failure_category == "invalid_review_result"
+        conn.execute("UPDATE inbox SET status=\"failed\" WHERE task_id=\"t1\" AND status IN (\"pending\", \"claimed\", \"launched\", \"running\")")
+        conn.commit()
 
         _set_pr_head(conn, "sha-b")
         orch.tick("t1")

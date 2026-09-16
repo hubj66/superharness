@@ -5,6 +5,7 @@ Dispatches the next pending inbox item to its target launcher.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.resources as _importlib_resources
 import json
 import logging
@@ -13,6 +14,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -86,6 +88,24 @@ def _abort(msg: str, code: int = 1) -> None:
     _log.error("abort: %s", msg)
     print(msg, file=sys.stderr)
     sys.exit(code)
+
+
+def _result_artifact_path(ctx: DispatchContext) -> str:
+    """Return a deterministic path writable by an isolated child process."""
+    project_root = os.path.realpath(ctx.project_dir)
+    execution_root = os.path.realpath(ctx.exec_project or ctx.project_dir)
+    if execution_root != project_root:
+        project_key = hashlib.sha256(
+            project_root.encode(encoding="utf-8")
+        ).hexdigest()
+        result_dir = os.path.join(
+            tempfile.gettempdir(), "superharness-run-results", project_key
+        )
+    else:
+        result_dir = os.path.join(ctx.project_dir, ".superharness", "run-results")
+    os.makedirs(result_dir, exist_ok=True)
+    filename = _safe_task_id_for_path(ctx.run_id or "run") + ".json"
+    return os.path.join(result_dir, filename)
 
 
 def _safe_task_id_for_path(task_id: str) -> str:
@@ -2343,11 +2363,11 @@ def _prepare_execution(ctx: DispatchContext) -> None:
     spawn_env["PYTHONUNBUFFERED"] = "1"
     if ctx.run_id:
         spawn_env["SUPERHARNESS_RUN_ID"] = ctx.run_id
-        result_dir = os.path.join(ctx.project_dir, ".superharness", "run-results")
-        os.makedirs(result_dir, exist_ok=True)
-        spawn_env["SUPERHARNESS_RUN_RESULT_PATH"] = os.path.join(
-            result_dir, f"{_safe_task_id_for_path(ctx.run_id)}.json"
-        )
+        spawn_env["SUPERHARNESS_RUN_RESULT_PATH"] = _result_artifact_path(ctx)
+        try:
+            os.unlink(spawn_env["SUPERHARNESS_RUN_RESULT_PATH"])
+        except FileNotFoundError:
+            pass
     if run_prompt:
         spawn_env["SUPERHARNESS_RUN_PROMPT"] = run_prompt
     if ctx.non_interactive:

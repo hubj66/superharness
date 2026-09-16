@@ -56,6 +56,103 @@ def test_set_task_status_writes_through_to_sqlite(
     assert foo.get("status") == "plan_proposed"
 
 
+
+def test_mirror_locked_task_skips_equivalent_empty_contract_shapes(clean_harness: Path, caplog) -> None:
+    import logging
+    from superharness.engine import tasks_dao
+    from superharness.engine.db import get_connection, init_db
+    from superharness.engine.tasks_dao import TaskRow
+
+    conn = get_connection(str(clean_harness))
+    init_db(conn)
+    tasks_dao.upsert(
+        conn,
+        TaskRow(
+            id="gh-1-r6",
+            title="Locked review task",
+            owner="claude-code",
+            status="review_requested",
+            effort=None,
+            project_path=str(clean_harness),
+            development_method=None,
+            acceptance_criteria=[],
+            test_types=[],
+            out_of_scope=[],
+            definition_of_done=[],
+            context=None,
+            tdd=None,
+            version=1,
+            created_at="2026-09-13T11:52:16Z",
+            locked_contract='{"acceptance_criteria": [], "tdd": null}',
+            contract_locked_at="2026-09-13T11:52:16Z",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    from superharness.engine import state_writer
+
+    with caplog.at_level(logging.WARNING, logger="superharness.engine.state_writer"):
+        state_writer.mirror_task_dict(
+            str(clean_harness),
+            {
+                "id": "gh-1-r6",
+                "status": "review_requested",
+                "acceptance_criteria": [],
+                "tdd": False,
+            },
+        )
+
+    assert "Cannot modify" not in caplog.text
+    assert "NameError" not in caplog.text
+    assert "_CONTRACT_LOCKED_FIELDS" not in caplog.text
+
+
+def test_mirror_locked_task_still_rejects_real_contract_change(clean_harness: Path) -> None:
+    from superharness.engine import tasks_dao
+    from superharness.engine.db import get_connection, init_db
+    from superharness.engine.state_errors import ContractLockError
+    from superharness.engine.tasks_dao import TaskRow
+
+    conn = get_connection(str(clean_harness))
+    init_db(conn)
+    tasks_dao.upsert(
+        conn,
+        TaskRow(
+            id="locked-change",
+            title="Locked task",
+            owner="claude-code",
+            status="review_requested",
+            effort=None,
+            project_path=str(clean_harness),
+            development_method=None,
+            acceptance_criteria=[],
+            test_types=[],
+            out_of_scope=[],
+            definition_of_done=[],
+            context=None,
+            tdd=None,
+            version=1,
+            created_at="2026-09-13T11:52:16Z",
+            locked_contract='{"acceptance_criteria": [], "tdd": null}',
+            contract_locked_at="2026-09-13T11:52:16Z",
+        ),
+    )
+    conn.commit()
+    task = tasks_dao.get(conn, "locked-change")
+    assert task is not None
+    try:
+        with pytest.raises(ContractLockError):
+            tasks_dao.update(
+                conn,
+                task.id,
+                task.version,
+                {"acceptance_criteria": ["real change"]},
+            )
+    finally:
+        conn.close()
+
+
 def test_set_inbox_status_writes_through(state_writer, clean_harness: Path) -> None:
     from superharness.engine.db import get_connection, init_db, transaction
     from superharness.engine import inbox_dao, tasks_dao

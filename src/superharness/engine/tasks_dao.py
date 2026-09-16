@@ -253,7 +253,7 @@ def get_all(
     return [_row_to_task(conn, row, deps_map[row["id"]]) for row in rows]
 
 
-_CONTRACT_LOCKED_FIELDS = frozenset({"acceptance_criteria", "tdd"})
+CONTRACT_LOCKED_FIELDS = frozenset({"acceptance_criteria", "tdd"})
 
 
 def update(
@@ -270,7 +270,7 @@ def update(
             f"Invalid status {changes['status']!r} for task '{id}'. "
             f"Valid statuses: {', '.join(sorted(VALID_STATUSES))}"
         )
-    locked_fields = _CONTRACT_LOCKED_FIELDS & changes.keys()
+    locked_fields = CONTRACT_LOCKED_FIELDS & changes.keys()
     if locked_fields:
         row = conn.execute(
             "SELECT contract_locked_at FROM tasks WHERE id = ?", (id,)

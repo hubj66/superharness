@@ -44,8 +44,9 @@ from superharness.engine.reliable_worktree import (
     is_managed_worktree_path,
     reliable_task_branch,
     rev_parse,
+    verify_review_worktree,
 )
-from superharness.engine.run_results import validate_result_for_run
+from superharness.engine.run_results import REVIEW_VERDICTS, validate_result_for_run
 from superharness.engine.shipper import SYSTEM_AGENT, SystemShipper
 from superharness.engine.state_errors import BoundaryError, StateError
 
@@ -80,7 +81,7 @@ REVIEW_RETRY_CATEGORIES = frozenset(
         "unknown",
     }
 )
-REVIEW_VALID_VERDICTS = frozenset({"LGTM", "REJECTED"})
+REVIEW_VALID_VERDICTS = REVIEW_VERDICTS
 
 
 def _now_utc() -> str:
@@ -615,7 +616,14 @@ class LifecycleOrchestrator:
         if failed_run.kind == "review" and target_sha:
             if metadata and metadata.get("source_agent") == failed_run.agent:
                 return False
-            if not metadata:
+            if self._safe_review_worktree(failed_run.worktree_path, target_sha):
+                worktree_path, branch_name, base_sha, head_sha = (
+                    failed_run.worktree_path,
+                    None,
+                    target_sha,
+                    target_sha,
+                )
+            elif not metadata:
                 metadata = {
                     "branch_name": failed_run.branch_name or "",
                     "pr_head_sha": target_sha,
@@ -790,6 +798,20 @@ class LifecycleOrchestrator:
             return current_branch_name(path) == reliable_task_branch(task.id) and bool(
                 rev_parse(path, "HEAD")
             )
+        except StateError:
+            return False
+
+    def _safe_review_worktree(self, path: str | None, target_sha: str) -> bool:
+        if (
+            not path
+            or not self._is_git_repo()
+            or not os.path.isdir(path)
+            or not is_managed_worktree_path(self.project_dir, path)
+        ):
+            return False
+        try:
+            verify_review_worktree(path, target_sha)
+            return True
         except StateError:
             return False
 
@@ -998,13 +1020,6 @@ class LifecycleOrchestrator:
                 self._transition_task(conn, task, "in_progress")
                 transitions += 1
             return transitions, created
-        if verdict == "BLOCKED":
-            runs_dao.record_run_diagnostic(
-                conn,
-                run.id,
-                failure_category="review_blocked",
-                failure_detail="Codex review returned BLOCKED",
-            )
         return 0, 0
 
     def _create_dispatch_run(
@@ -1240,7 +1255,7 @@ class LifecycleOrchestrator:
                 f"PR: {metadata['pr_url']} (#{metadata['pr_number']})",
                 f"Review target SHA: {metadata['pr_head_sha']}",
                 "Write the structured Superharness execution result JSON to SUPERHARNESS_RUN_RESULT_PATH.",
-                "The review_verdict must be LGTM, REJECTED, or BLOCKED.",
+                "The review_verdict must be LGTM or REJECTED.",
                 "The reviewed_sha must exactly equal the review target SHA.",
                 "If REJECTED, include concrete findings in the findings list.",
             ]

@@ -499,3 +499,148 @@ def test_review_artifact_with_wrong_run_id_fails_run(tmp_path):
         assert run.failure_category == "invalid_result"
     finally:
         conn.close()
+
+
+def test_isolated_run_uses_writable_result_artifact_path(tmp_path):
+    project, conn = _project(tmp_path)
+    worktree = tmp_path / "review-worktree"
+    worktree.mkdir()
+    try:
+        ctx = DispatchContext(
+            project_dir=str(project),
+            inbox_file=str(project / ".superharness" / "inbox.yaml"),
+            contract_file=str(project / ".superharness" / "contract.yaml"),
+            print_only=False,
+            non_interactive=True,
+            codex_bypass=False,
+            launcher_timeout=0,
+            script_dir=str(project),
+            sqlite_primary=True,
+            item_id="inbox-1",
+            item_task="t1",
+            item_to="codex-cli",
+            item_project=str(worktree),
+            exec_project=str(worktree),
+            run_id="run-1",
+            item={"plan_only": False},
+        )
+        _prepare_execution(ctx)
+        result_path = Path(ctx.spawn_env["SUPERHARNESS_RUN_RESULT_PATH"])
+        assert not result_path.is_relative_to(project / ".superharness")
+        result_path.write_text("stale", encoding="utf-8")
+        _prepare_execution(ctx)
+        assert not result_path.exists()
+        result_path.write_text("{}", encoding="utf-8")
+        assert result_path.is_file()
+    finally:
+        conn.close()
+
+
+
+def test_result_artifact_path_is_deterministic_and_project_isolated(tmp_path):
+    import hashlib
+    from types import SimpleNamespace
+
+    from superharness.commands.inbox_dispatch import _result_artifact_path
+
+    project_a = tmp_path / "project-a"
+    context_a = SimpleNamespace(
+        project_dir=str(project_a),
+        exec_project=str(tmp_path / "worktree-a"),
+        run_id="run-1",
+    )
+    path_a = _result_artifact_path(context_a)
+    assert _result_artifact_path(context_a) == path_a
+    assert Path(path_a).name == "run-1.json"
+    assert Path(path_a).parent.name == hashlib.sha256(
+        str(project_a.resolve()).encode("utf-8")
+    ).hexdigest()
+
+    context_b = SimpleNamespace(
+        project_dir=str(tmp_path / "project-b"),
+        exec_project=str(tmp_path / "worktree-b"),
+        run_id="run-1",
+    )
+    path_b = _result_artifact_path(context_b)
+    assert Path(path_b).parent != Path(path_a).parent
+
+    context_a.run_id = "run-2"
+    path_a2 = _result_artifact_path(context_a)
+    assert Path(path_a2).parent == Path(path_a).parent
+    assert Path(path_a2).name == "run-2.json"
+    assert path_a2 != path_a
+
+
+
+@pytest.mark.parametrize(
+    ("artifact", "expected_status"),
+    [
+        (
+            {
+                "run_id": "run-1",
+                "task_id": "t1",
+                "status": "success",
+                "summary": "implemented",
+                "files_changed": ["calculator.py"],
+                "test_results": {"passed": 4, "failed": 0, "errors": 0},
+            },
+            "failed",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "run_id": "run-1",
+                "task_id": "t1",
+                "kind": "implement",
+                "agent": "claude-code",
+                "exit_code": 0,
+                "completion_status": "completed",
+                "worktree_path": "/tmp/worktree",
+                "branch_name": "shux/reliable/t1",
+                "base_sha": "sha-base",
+                "head_sha": "sha-head",
+                "dirty": True,
+                "changed_files": ["calculator.py"],
+            },
+            "succeeded",
+        ),
+    ],
+)
+def test_implement_artifact_must_match_authoritative_result_contract(
+    tmp_path, artifact, expected_status
+):
+    project, conn = _project(tmp_path)
+    try:
+        _sqlite_claim_next(str(project), "claude-code", NOW)
+        ctx = DispatchContext(
+            project_dir=str(project),
+            inbox_file=str(project / ".superharness" / "inbox.yaml"),
+            contract_file=str(project / ".superharness" / "contract.yaml"),
+            print_only=False,
+            non_interactive=True,
+            codex_bypass=False,
+            launcher_timeout=0,
+            script_dir=str(project),
+            sqlite_primary=True,
+            item_id="inbox-1",
+            item_task="t1",
+            item_to="claude-code",
+            item_project=str(project),
+            exec_project=str(project),
+            run_id="run-1",
+            item={"plan_only": False},
+        )
+        _prepare_execution(ctx)
+        Path(ctx.spawn_env["SUPERHARNESS_RUN_RESULT_PATH"]).write_text(
+            json.dumps(artifact), encoding="utf-8"
+        )
+        _reliable_run_started(ctx, pid=None)
+        ctx.launcher_rc = 0
+        _reliable_run_finished(ctx)
+        run = runs_dao.get_run(conn, "run-1")
+        assert run is not None
+        assert run.status == expected_status
+        if expected_status == "failed":
+            assert run.failure_category == "invalid_result"
+    finally:
+        conn.close()

@@ -172,6 +172,7 @@ def _build_reliable_task_execution_prompt(
     context_hint: str,
     user_instructions: str,
     auto_directive: str,
+    result_path: str | None = None
 ) -> str:
     """Build the agent contract for one durable reliable-orchestrator Run.
 
@@ -189,6 +190,12 @@ def _build_reliable_task_execution_prompt(
         "Do not commit, push, create or update a PR, merge, enable auto-merge, "
         "invoke /ship, or close the task.\n"
     )
+    from superharness.engine.run_results import reliable_result_instructions
+    result_contract = reliable_result_instructions(
+        run_id=run_id, task_id=task_id, kind=run_kind, agent=target,
+        artifact_path=result_path, review_target_sha=review_target_sha,
+    )
+
     if run_kind == "plan":
         role = (
             "Planning only: inspect the task and repository as needed, then provide "
@@ -212,6 +219,7 @@ def _build_reliable_task_execution_prompt(
     return (
         common
         + role
+        + result_contract
         + acceptance_criteria
         + context_hint
         + user_instructions
@@ -1528,6 +1536,12 @@ def delegate(
         run_prompt = os.environ.get("SUPERHARNESS_RUN_PROMPT", "").strip()
         if run_prompt and os.environ.get("SUPERHARNESS_RUN_ID", "").strip():
             user_instructions += f"\n\nRun instructions:\n{run_prompt}"
+        result_path = os.environ.get("SUPERHARNESS_RUN_RESULT_PATH", "").strip()
+        if reliable_run_bound and result_path:
+            user_instructions += (
+                f"\n\nResolved structured result artifact path: {result_path}\n"
+                "Write the JSON artifact to this exact path; stdout alone is not a result handoff."
+            )
 
         # Build context hint to reduce cold-start exploration time
         context_hint = build_context_hint(project_dir, task_obj or {})
@@ -1540,6 +1554,7 @@ def delegate(
                 run_id=reliable_run.id,
                 run_kind=reliable_run.kind,
                 review_target_sha=reliable_run.review_target_sha,
+                result_path=result_path or None,
                 acceptance_criteria=acceptance_criteria,
                 context_hint=context_hint,
                 user_instructions=user_instructions,

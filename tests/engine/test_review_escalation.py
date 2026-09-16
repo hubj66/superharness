@@ -170,3 +170,57 @@ def test_review_escalation_dual_mode_writes_contract_yaml(
     t = on_disk["tasks"][0]
     assert t["review_chain_index"] == 1
     assert t["review_target"] == "gemini-cli"
+
+
+@pytest.mark.regression
+def test_review_escalation_skips_reliable_tasks_but_handles_legacy_tasks(clean_harness: Path) -> None:
+    from superharness.engine.review_escalation import escalate_stale_reviews
+
+    _write_contract(clean_harness, [
+        {
+            "id": "reliable.task",
+            "workflow": "reliable-orchestrator",
+            "owner": "claude-code",
+            "status": "review_requested",
+            "review_requested_at": past_iso(121),
+            "review_chain": ["codex-cli"],
+            "review_chain_index": 0,
+            "review_target": "codex-cli",
+        },
+        {
+            "id": "legacy.task",
+            "owner": "claude-code",
+            "status": "review_requested",
+            "review_requested_at": past_iso(121),
+            "review_chain": ["codex-cli"],
+            "review_chain_index": 0,
+            "review_target": "codex-cli",
+        },
+    ])
+
+    assert escalate_stale_reviews(str(clean_harness)) == 1
+    tasks = {task["id"]: task for task in _read_contract(clean_harness)["tasks"]}
+    reliable = tasks["reliable.task"]
+    assert "escalated_to" not in reliable
+    assert "escalated_at" not in reliable
+    assert reliable["review_chain_index"] == 0
+    assert tasks["legacy.task"]["escalated_to"] == "operator"
+
+
+@pytest.mark.regression
+def test_exhausted_reliable_review_has_no_legacy_action(clean_harness: Path) -> None:
+    from superharness.engine.review_escalation import escalate_stale_reviews
+
+    _write_contract(clean_harness, [{
+        "id": "reliable.exhausted",
+        "workflow": "reliable-orchestrator",
+        "owner": "claude-code",
+        "status": "review_requested",
+        "review_requested_at": past_iso(121),
+    }])
+
+    assert escalate_stale_reviews(str(clean_harness)) == 0
+    task = _read_contract(clean_harness)["tasks"][0]
+    assert task["status"] == "review_requested"
+    assert "escalated_to" not in task
+    assert "escalated_at" not in task

@@ -674,6 +674,15 @@ _SKIP_TASK_FIELDS = frozenset(
 )
 
 
+def _canonical_locked_field(name: str, value: object) -> object:
+    """Normalize legacy empty representations before comparing locked fields."""
+    if name == "acceptance_criteria":
+        return [] if value is None else value
+    if name == "tdd":
+        return None if not value else value
+    return value
+
+
 def _mirror_task_to_sqlite(
     project_dir: str, task_id: str, status: str, **fields
 ) -> None:
@@ -711,6 +720,13 @@ def _mirror_task_to_sqlite(
                     if k in _SKIP_TASK_FIELDS:
                         continue
                     elif k in _KNOWN_TASK_COLS:
+                        if (
+                            k in tasks_dao.CONTRACT_LOCKED_FIELDS
+                            and row.contract_locked_at
+                            and _canonical_locked_field(k, getattr(row, k))
+                            == _canonical_locked_field(k, v)
+                        ):
+                            continue
                         changes[k] = v
                     else:
                         extras[k] = v
