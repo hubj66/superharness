@@ -7,6 +7,8 @@ import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
+import pytest
+
 from superharness.engine import runs_dao, tasks_dao
 from superharness.engine.lifecycle_orchestrator import LifecycleOrchestrator
 from superharness.engine.db import get_connection, init_db
@@ -14,10 +16,12 @@ from superharness.engine.reliable_worktree import (
     create_managed_worktree,
     create_repair_worktree,
     create_review_worktree,
+    recover_repair_worktree,
     reliable_task_branch,
     _is_clean,
 )
 from superharness.engine.shipper import CommandResult, SystemShipper
+from superharness.engine.state_errors import StateError
 
 NOW = "2026-01-01T00:00:00Z"
 
@@ -390,6 +394,34 @@ def test_repair_worktree_resets_same_task_branch_to_current_remote_head(tmp_path
     assert repair.branch_name == branch
     assert repair.base_sha == pr_head
     assert _run(worktree, "rev-parse", "HEAD") == pr_head
+
+
+def test_recovery_worktree_preserves_uncommitted_changes_at_remote_head(tmp_path):
+    project, worktree, branch, base_sha = _shipping_fixture(tmp_path)
+    _run(worktree, "push", "origin", f"{branch}:{branch}")
+    (worktree / "README.md").write_text("repaired but unshipped\n", encoding="utf-8")
+
+    recovered = recover_repair_worktree(
+        str(project), "t1", branch_name=branch, expected_head_sha=base_sha
+    )
+
+    assert recovered.path == str(worktree)
+    assert recovered.branch_name == branch
+    assert recovered.base_sha == base_sha
+    assert _run(worktree, "rev-parse", "HEAD") == base_sha
+    assert (worktree / "README.md").read_text(encoding="utf-8") == (
+        "repaired but unshipped\n"
+    )
+
+
+def test_recovery_worktree_rejects_clean_worktree(tmp_path):
+    project, worktree, branch, base_sha = _shipping_fixture(tmp_path)
+    _run(worktree, "push", "origin", f"{branch}:{branch}")
+
+    with pytest.raises(StateError, match="no uncommitted changes"):
+        recover_repair_worktree(
+            str(project), "t1", branch_name=branch, expected_head_sha=base_sha
+        )
 
 
 def test_shipper_commits_intended_files_excludes_control_plane_and_pushes_origin(

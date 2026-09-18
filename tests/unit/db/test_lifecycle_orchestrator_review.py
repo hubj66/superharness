@@ -7,6 +7,7 @@ from pathlib import Path
 from superharness.engine import agent_availability, inbox_dao, runs_dao, tasks_dao
 from superharness.engine.db import get_connection, init_db
 from superharness.engine.lifecycle_orchestrator import LifecycleOrchestrator
+from superharness.engine.reliable_worktree import ManagedWorktree
 from superharness.engine.state_errors import StateError
 from superharness.engine.shipper import ShipOutcome
 
@@ -162,6 +163,64 @@ def _set_pr_head(conn, sha: str) -> None:
     assert task is not None
     tasks_dao.update(conn, task.id, task.version, {"extras_json": _metadata(sha)})
     conn.commit()
+
+
+def _failed_unsafe_repair_ship(conn) -> runs_dao.RunRow:
+    review = runs_dao.create_run(
+        conn,
+        id="review-trigger",
+        task_id="t1",
+        kind="review",
+        agent="codex-cli",
+        dedupe_key="review:t1:sha-a:historical",
+        review_target_sha="sha-a",
+        now=NOW,
+    )
+    runs_dao.transition_run(conn, review.id, to_status="claimed", now=NOW)
+    runs_dao.transition_run(conn, review.id, to_status="running", now=NOW)
+    runs_dao.transition_run(conn, review.id, to_status="succeeded", now=NOW)
+    runs_dao.mark_run_consumed(conn, review.id, now=NOW)
+    repair = runs_dao.create_run(
+        conn,
+        id="repair-corrupted",
+        task_id="t1",
+        kind="repair",
+        agent="claude-code",
+        dedupe_key="repair:t1:review-trigger",
+        trigger_run_id=review.id,
+        worktree_path="/historical/untrusted/path",
+        branch_name="historical/untrusted-branch",
+        base_sha="sha-b",
+        head_sha="sha-a",
+        now=NOW,
+    )
+    runs_dao.transition_run(conn, repair.id, to_status="claimed", now=NOW)
+    runs_dao.transition_run(conn, repair.id, to_status="running", now=NOW)
+    runs_dao.transition_run(conn, repair.id, to_status="succeeded", now=NOW)
+    runs_dao.mark_run_consumed(conn, repair.id, now=NOW)
+    ship = runs_dao.create_run(
+        conn,
+        id="ship-failed",
+        task_id="t1",
+        kind="ship",
+        agent="system",
+        dedupe_key="ship:t1:repair-corrupted:sha-a",
+        parent_run_id=repair.id,
+        now=NOW,
+    )
+    runs_dao.transition_run(conn, ship.id, to_status="claimed", now=NOW)
+    runs_dao.transition_run(conn, ship.id, to_status="running", now=NOW)
+    runs_dao.transition_run(
+        conn,
+        ship.id,
+        to_status="failed",
+        now=NOW,
+        failure_category="unsafe_agent_commit",
+        failure_detail="remote branch is sha-a, not recorded base sha-b",
+    )
+    runs_dao.mark_run_consumed(conn, ship.id, now=NOW)
+    conn.commit()
+    return runs_dao.get_run(conn, ship.id) or ship
 
 
 def test_pr_open_creates_one_codex_review_for_exact_sha(tmp_path):
@@ -625,5 +684,171 @@ def test_blocked_or_invalid_review_result_does_not_advance(tmp_path):
             runs_dao.get_run(conn, new_review.id).failure_category
             == "invalid_review_result"
         )
+    finally:
+        conn.close()
+
+
+def test_unsafe_ship_recovers_once_from_remote_head_not_corrupted_run(
+    tmp_path, monkeypatch
+):
+    project, conn = _project(tmp_path)
+    recovered_path = "/tmp/superharness-worktrees/reliable/project/shux-reliable-t1"
+    calls = []
+    try:
+        _task(conn, status="in_progress", sha="sha-a")
+        failed_ship = _failed_unsafe_repair_ship(conn)
+
+        def recover(project_dir, task_id, *, branch_name, expected_head_sha):
+            calls.append((project_dir, task_id, branch_name, expected_head_sha))
+            return ManagedWorktree(recovered_path, branch_name, expected_head_sha)
+
+        monkeypatch.setattr(LifecycleOrchestrator, "_is_git_repo", lambda self: True)
+        monkeypatch.setattr(
+            "superharness.engine.lifecycle_orchestrator.recover_repair_worktree",
+            recover,
+        )
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+
+        orch.tick("t1")
+        orch.tick("t1")
+
+        repairs = runs_dao.list_runs_for_task(conn, "t1", kind="repair")
+        assert len(repairs) == 2
+        recovery = next(run for run in repairs if run.id != "repair-corrupted")
+        assert recovery.trigger_run_id == failed_ship.id
+        assert recovery.parent_run_id == failed_ship.id
+        assert recovery.worktree_path == recovered_path
+        assert recovery.branch_name == "shux/reliable/t1"
+        assert recovery.base_sha == "sha-a"
+        assert recovery.head_sha == "sha-a"
+        assert recovery.base_sha != "sha-b"
+        assert calls == [(str(project), "t1", "shux/reliable/t1", "sha-a")]
+        assert runs_dao.get_run(conn, failed_ship.id).orchestrator_consumed_at == NOW
+        assert tasks_dao.get(conn, "t1").status == "in_progress"
+    finally:
+        conn.close()
+
+
+def test_recovered_repair_can_ship_and_create_review(tmp_path, monkeypatch):
+    project, conn = _project(tmp_path)
+    recovered_path = "/tmp/superharness-worktrees/reliable/project/shux-reliable-t1"
+    shipper = FakeShipper(
+        [
+            ShipOutcome(
+                ok=True,
+                branch_name="shux/reliable/t1",
+                base_sha="sha-a",
+                head_sha="sha-c",
+                remote_head_sha="sha-c",
+                pr_number=42,
+                pr_url="https://github.com/o/r/pull/42",
+                worktree_path=recovered_path,
+            )
+        ]
+    )
+    try:
+        _task(conn, status="in_progress", sha="sha-a")
+        _failed_unsafe_repair_ship(conn)
+        monkeypatch.setattr(LifecycleOrchestrator, "_is_git_repo", lambda self: True)
+        monkeypatch.setattr(
+            "superharness.engine.lifecycle_orchestrator.recover_repair_worktree",
+            lambda project_dir, task_id, branch_name, expected_head_sha: (
+                ManagedWorktree(recovered_path, branch_name, expected_head_sha)
+            ),
+        )
+        orch = LifecycleOrchestrator(
+            str(project), now=lambda: NOW, shipper_factory=lambda _project: shipper
+        )
+
+        orch.tick("t1")
+        recovery = next(
+            run
+            for run in runs_dao.list_runs_for_task(conn, "t1", kind="repair")
+            if run.trigger_run_id == "ship-failed"
+        )
+        monkeypatch.setattr(LifecycleOrchestrator, "_is_git_repo", lambda self: False)
+        _complete_repair(conn, recovery)
+        orch.tick("t1")
+        orch.tick("t1")
+
+        task = tasks_dao.get(conn, "t1")
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        assert task is not None and task.status == "review_requested"
+        assert shipper.calls == 1
+        assert any(review.review_target_sha == "sha-c" for review in reviews)
+    finally:
+        conn.close()
+
+
+def test_unsafe_ship_without_safe_recovery_worktree_blocks_task(tmp_path, monkeypatch):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="in_progress", sha="sha-a")
+        failed_ship = _failed_unsafe_repair_ship(conn)
+        monkeypatch.setattr(LifecycleOrchestrator, "_is_git_repo", lambda self: True)
+
+        def reject_recovery(*args, **kwargs):
+            raise StateError("managed repair worktree is not based on remote PR head")
+
+        monkeypatch.setattr(
+            "superharness.engine.lifecycle_orchestrator.recover_repair_worktree",
+            reject_recovery,
+        )
+
+        LifecycleOrchestrator(str(project), now=lambda: NOW).tick("t1")
+
+        task = tasks_dao.get(conn, "t1")
+        ship = runs_dao.get_run(conn, failed_ship.id)
+        assert task is not None and task.status == "blocked"
+        assert "managed repair worktree" in (task.pause_reason or "")
+        assert ship is not None and "managed repair worktree" in (
+            ship.failure_detail or ""
+        )
+        assert len(runs_dao.list_runs_for_task(conn, "t1", kind="repair")) == 1
+    finally:
+        conn.close()
+
+
+def test_unsafe_ship_without_pr_metadata_blocks_task(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="in_progress", sha="sha-a")
+        failed_ship = _failed_unsafe_repair_ship(conn)
+        task = tasks_dao.get(conn, "t1")
+        assert task is not None
+        tasks_dao.update(conn, task.id, task.version, {"extras_json": "{}"})
+        conn.commit()
+
+        LifecycleOrchestrator(str(project), now=lambda: NOW).tick("t1")
+
+        task = tasks_dao.get(conn, "t1")
+        ship = runs_dao.get_run(conn, failed_ship.id)
+        assert task is not None and task.status == "blocked"
+        assert "missing authoritative task PR metadata" in (task.pause_reason or "")
+        assert ship is not None and "missing authoritative task PR metadata" in (
+            ship.failure_detail or ""
+        )
+    finally:
+        conn.close()
+
+
+def test_ship_failure_without_safe_recovery_class_blocks_task(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="in_progress", sha="sha-a")
+        failed_ship = _failed_unsafe_repair_ship(conn)
+        conn.execute(
+            "UPDATE runs SET failure_category='push_failed', "
+            "failure_detail='origin unavailable' WHERE id=?",
+            (failed_ship.id,),
+        )
+        conn.commit()
+
+        LifecycleOrchestrator(str(project), now=lambda: NOW).tick("t1")
+
+        task = tasks_dao.get(conn, "t1")
+        assert task is not None and task.status == "blocked"
+        assert "push_failed" in (task.pause_reason or "")
+        assert runs_dao.list_active_runs(conn, task_id="t1") == []
     finally:
         conn.close()

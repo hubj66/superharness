@@ -230,6 +230,42 @@ def create_repair_worktree(
     return ManagedWorktree(path=path, branch_name=branch_name, base_sha=remote_sha)
 
 
+def recover_repair_worktree(
+    project_dir: str,
+    task_id: str,
+    *,
+    branch_name: str,
+    expected_head_sha: str,
+    remote: str = DEFAULT_REMOTE,
+) -> ManagedWorktree:
+    """Verify a dirty managed repair worktree without changing its Git state."""
+    remote_sha = resolve_remote_branch_sha(
+        project_dir, remote=remote, branch=branch_name
+    )
+    if remote_sha != expected_head_sha:
+        raise StateError(
+            f"Remote {remote}/{branch_name} is {remote_sha}, not {expected_head_sha}"
+        )
+    root = managed_worktree_root(project_dir)
+    path = os.path.join(root, branch_name.replace("/", "-"))
+    if not os.path.isdir(path):
+        raise StateError(f"Managed repair worktree {path!r} does not exist")
+    if not is_managed_worktree_path(project_dir, path):
+        raise StateError(f"Repair worktree {path!r} is outside managed roots")
+    if _git_common_dir(project_dir) != _git_common_dir(path):
+        raise StateError(f"Repair worktree {path!r} is not from this repository")
+    if current_branch_name(path) != branch_name:
+        raise StateError(f"Repair worktree {path!r} is not on {branch_name!r}")
+    if rev_parse(path, "HEAD") != remote_sha:
+        raise StateError(
+            f"Repair worktree {path!r} is not based on remote PR head {remote_sha}"
+        )
+    if _is_clean(path):
+        raise StateError(f"Repair worktree {path!r} has no uncommitted changes")
+    _link_superharness_state(project_dir, path)
+    return ManagedWorktree(path=path, branch_name=branch_name, base_sha=remote_sha)
+
+
 def resolve_remote_branch_sha(project_dir: str, *, remote: str, branch: str) -> str:
     _run_git(project_dir, "fetch", remote, branch)
     return rev_parse(project_dir, f"refs/remotes/{remote}/{branch}^{{commit}}")
@@ -287,6 +323,13 @@ def _is_clean(project_dir: str) -> bool:
         return False
     entries = [entry for entry in result.stdout.splitlines() if entry.strip()]
     return not any(not _is_control_plane_entry(entry) for entry in entries)
+
+
+def _git_common_dir(project_dir: str) -> str:
+    value = _run_git(project_dir, "rev-parse", "--git-common-dir").stdout.strip()
+    if not os.path.isabs(value):
+        value = os.path.join(project_dir, value)
+    return os.path.realpath(value)
 
 
 def _is_control_plane_entry(entry: str) -> bool:

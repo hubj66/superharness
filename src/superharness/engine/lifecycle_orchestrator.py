@@ -42,6 +42,7 @@ from superharness.engine.reliable_worktree import (
     create_review_worktree,
     current_branch_name,
     is_managed_worktree_path,
+    recover_repair_worktree,
     reliable_task_branch,
     rev_parse,
     verify_review_worktree,
@@ -151,6 +152,18 @@ class LifecycleOrchestrator:
                         runs_created=result.runs_created + created,
                         results_consumed=result.results_consumed + consumed,
                         transitions=result.transitions + transitions,
+                    )
+                    task = tasks_dao.get(conn, task.id)
+                    if task is None:
+                        continue
+                    recovered, recovery_transitions = (
+                        self._recover_stranded_failed_ship(conn, task)
+                    )
+                    result = TickResult(
+                        inspected=result.inspected,
+                        runs_created=result.runs_created + recovered,
+                        results_consumed=result.results_consumed,
+                        transitions=result.transitions + recovery_transitions,
                     )
                     task = tasks_dao.get(conn, task.id)
                     if task is None:
@@ -517,9 +530,9 @@ class LifecycleOrchestrator:
     def _route_failed_run(
         self, conn, task: tasks_dao.TaskRow, run: runs_dao.RunRow
     ) -> tuple[int, int]:
-        classification = self._classify_run_failure(run)
         if run.kind == "ship":
-            return 0, 0
+            return self._route_failed_ship(conn, task, run)
+        classification = self._classify_run_failure(run)
         runs_dao.record_run_diagnostic(
             conn,
             run.id,
@@ -596,6 +609,113 @@ class LifecycleOrchestrator:
             return 0, self._move_task(conn, task, "blocked")
         return 0, 0
 
+    def _recover_stranded_failed_ship(
+        self, conn, task: tasks_dao.TaskRow
+    ) -> tuple[int, int]:
+        """Recover or block an idle task whose failed ship was already consumed."""
+        if task.status != "in_progress" or runs_dao.list_active_runs(
+            conn, task_id=task.id
+        ):
+            return 0, 0
+        ship_runs = runs_dao.list_runs_for_task(conn, task.id, kind="ship")
+        if not ship_runs:
+            return 0, 0
+        latest = ship_runs[-1]
+        if latest.status == "succeeded" or latest.orchestrator_consumed_at is None:
+            return 0, 0
+        return self._route_failed_ship(conn, task, latest)
+
+    def _route_failed_ship(
+        self, conn, task: tasks_dao.TaskRow, run: runs_dao.RunRow
+    ) -> tuple[int, int]:
+        category = run.failure_category or "ship_failure"
+        if category != "unsafe_agent_commit":
+            return self._block_failed_ship(
+                conn,
+                task,
+                run,
+                f"ship failure {category!r} requires operator intervention: "
+                f"{run.failure_detail or 'no failure detail recorded'}",
+            )
+
+        existing = [
+            candidate
+            for candidate in runs_dao.list_runs_for_task(conn, task.id, kind="repair")
+            if candidate.trigger_run_id == run.id
+        ]
+        if existing:
+            return 0, 0
+        metadata = self._pr_metadata(task)
+        if metadata is None:
+            return self._block_failed_ship(
+                conn, task, run, "missing authoritative task PR metadata"
+            )
+        if not self._is_git_repo():
+            return self._block_failed_ship(
+                conn, task, run, "project is not an available Git repository"
+            )
+        source_run = (
+            runs_dao.get_run(conn, run.parent_run_id) if run.parent_run_id else None
+        )
+        if source_run is None or source_run.kind not in {"repair", "fallback"}:
+            return self._block_failed_ship(
+                conn,
+                task,
+                run,
+                "unsafe ship did not originate from a repair or fallback Run",
+            )
+        try:
+            worktree = recover_repair_worktree(
+                self.project_dir,
+                task.id,
+                branch_name=metadata["branch_name"],
+                expected_head_sha=metadata["pr_head_sha"],
+            )
+        except StateError as exc:
+            return self._block_failed_ship(conn, task, run, str(exc))
+        assignment = self._select_mutator(conn, task, preferred_agent=source_run.agent)
+        if assignment is None:
+            return self._block_failed_ship(
+                conn, task, run, "no eligible mutating agent is currently available"
+            )
+        current_sha = metadata["pr_head_sha"]
+        prompt = self._ship_recovery_prompt(task, metadata, run)
+        self._create_dispatch_run(
+            conn,
+            task,
+            kind="repair",
+            dedupe_key=f"ship-recovery:{task.id}:{run.id}:{current_sha}",
+            agent=assignment.agent,
+            model=assignment.model,
+            parent_run_id=run.id,
+            trigger_run_id=run.id,
+            worktree_path=worktree.path,
+            branch_name=worktree.branch_name,
+            base_sha=current_sha,
+            head_sha=current_sha,
+            pr_number=metadata["pr_number"],
+            pr_url=metadata["pr_url"],
+            prompt=prompt,
+        )
+        return 1, 0
+
+    def _block_failed_ship(
+        self,
+        conn,
+        task: tasks_dao.TaskRow,
+        run: runs_dao.RunRow,
+        reason: str,
+    ) -> tuple[int, int]:
+        category = run.failure_category or "ship_failure"
+        detail = f"ship recovery blocked after {category}: {reason}"
+        runs_dao.record_run_diagnostic(
+            conn,
+            run.id,
+            failure_category=category,
+            failure_detail=detail,
+        )
+        return 0, self._move_task(conn, task, "blocked", reason=detail)
+
     def _classify_run_failure(self, run: runs_dao.RunRow):
         if run.status == "quota_blocked":
             return ReliableFailureClassification(
@@ -626,10 +746,17 @@ class LifecycleOrchestrator:
             invalid_result=run.failure_category == "dispatcher_failure",
         )
 
-    def _move_task(self, conn, task: tasks_dao.TaskRow, status: str) -> int:
+    def _move_task(
+        self,
+        conn,
+        task: tasks_dao.TaskRow,
+        status: str,
+        *,
+        reason: str | None = None,
+    ) -> int:
         current = tasks_dao.get(conn, task.id) or task
         if current.status != status:
-            self._transition_task(conn, current, status)
+            self._transition_task(conn, current, status, reason=reason)
             return 1
         return 0
 
@@ -1324,6 +1451,26 @@ class LifecycleOrchestrator:
             ]
         )
 
+    def _ship_recovery_prompt(
+        self,
+        task: tasks_dao.TaskRow,
+        metadata: dict[str, Any],
+        failed_ship_run: runs_dao.RunRow,
+    ) -> str:
+        return "\n".join(
+            [
+                "=== RELIABLE ORCHESTRATOR SHIP RECOVERY ===",
+                "Recover the existing uncommitted repair only. Do not make unrelated changes.",
+                "Do not reset, commit, push, merge, enable auto-merge, or close the task.",
+                "System shipping owns commit, push, PR update, and SHA confirmation.",
+                f"Task: {task.id} - {task.title}",
+                f"Failed system ship Run: {failed_ship_run.id}",
+                f"Current authoritative PR head SHA: {metadata['pr_head_sha']}",
+                f"PR: {metadata['pr_url']} (#{metadata['pr_number']})",
+                "Verify the preserved repair changes, run focused tests, and write the structured Run result JSON to SUPERHARNESS_RUN_RESULT_PATH.",
+            ]
+        )
+
     def _queued_ship_runs(self, conn, *, task_id: str | None = None) -> list[str]:
         query = """
             SELECT r.id
@@ -1517,12 +1664,21 @@ class LifecycleOrchestrator:
     def _is_git_repo(self) -> bool:
         return os.path.isdir(os.path.join(self.project_dir, ".git"))
 
-    def _transition_task(self, conn, task: tasks_dao.TaskRow, new_status: str) -> None:
+    def _transition_task(
+        self,
+        conn,
+        task: tasks_dao.TaskRow,
+        new_status: str,
+        *,
+        reason: str | None = None,
+    ) -> None:
         if task.status == new_status:
             return
         validate_status_transition(task.status, new_status)
         now = self._now()
         changes: dict[str, Any] = {"status": new_status, "updated_at": now}
+        if new_status == "blocked" and reason:
+            changes["pause_reason"] = reason
         timestamp_columns = {
             "plan_proposed": "plan_proposed_at",
             "plan_approved": "plan_approved_at",

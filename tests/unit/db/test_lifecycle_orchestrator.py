@@ -143,7 +143,8 @@ def test_implementation_success_is_consumed_and_creates_ship_without_close(tmp_p
         orch.tick("t1")
         task = tasks_dao.get(conn, "t1")
         run = runs_dao.get_run(conn, implementation.id)
-        assert task is not None and task.status == "in_progress"
+        assert task is not None and task.status == "blocked"
+        assert "ship recovery blocked" in (task.pause_reason or "")
         assert run is not None and run.orchestrator_consumed_at is not None
         assert len(runs_dao.list_runs_for_task(conn, "t1", kind="ship")) == 1
         assert len(runs_dao.list_runs_for_task(conn, "t1", kind="review")) == 0

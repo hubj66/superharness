@@ -96,7 +96,8 @@ def test_implementation_success_creates_one_system_ship_run(tmp_path):
         assert ship_runs[0].agent == "system"
         assert ship_runs[0].parent_run_id == "impl-t1"
         assert ship_runs[0].status == "failed"
-        assert task is not None and task.status == "in_progress"
+        assert task is not None and task.status == "blocked"
+        assert "push_failed" in (task.pause_reason or "")
 
     finally:
         conn.close()
@@ -213,7 +214,8 @@ def test_remote_sha_mismatch_blocks_pr_open(tmp_path):
         orch.tick("t1")
         task = tasks_dao.get(conn, "t1")
         ship = runs_dao.list_runs_for_task(conn, "t1", kind="ship")[0]
-        assert task is not None and task.status == "in_progress"
+        assert task is not None and task.status == "blocked"
+        assert "remote_head_mismatch" in (task.pause_reason or "")
         assert ship.status == "failed"
         assert ship.failure_category == "remote_head_mismatch"
 
