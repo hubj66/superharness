@@ -84,6 +84,7 @@ REVIEW_RETRY_CATEGORIES = frozenset(
 )
 REVIEW_VALID_VERDICTS = REVIEW_VERDICTS
 REVIEW_RECOVERY_DEDUPE_PREFIX = "review-recovery:"
+OPERATOR_REVIEW_DEDUPE_PREFIX = "operator-review:"
 
 
 def _now_utc() -> str:
@@ -575,6 +576,21 @@ class LifecycleOrchestrator:
                     ),
                 )
                 return 0, 0
+            if self._is_operator_review(run):
+                # Operator re-review is one independent attempt with no auto-recovery
+                # or retry — any failure blocks the task immediately.
+                detail = (
+                    f"operator re-review {run.id} failed with "
+                    f"{classification.category!r}; "
+                    "no further automatic recovery"
+                )
+                runs_dao.record_run_diagnostic(
+                    conn,
+                    run.id,
+                    failure_category=classification.category,
+                    failure_detail=detail,
+                )
+                return 0, self._move_task(conn, task, "blocked", reason=detail)
             if (
                 self._is_review_recovery(run)
                 and classification.category == "invalid_result"
@@ -659,7 +675,11 @@ class LifecycleOrchestrator:
         ):
             return 0, 0
         reviews = runs_dao.list_runs_for_task(conn, task.id, kind="review")
-        normal_reviews = [run for run in reviews if not self._is_review_recovery(run)]
+        normal_reviews = [
+            run
+            for run in reviews
+            if not self._is_review_recovery(run) and not self._is_operator_review(run)
+        ]
         if not normal_reviews:
             return 0, 0
 
@@ -843,6 +863,9 @@ class LifecycleOrchestrator:
     @staticmethod
     def _is_review_recovery(run: runs_dao.RunRow) -> bool:
         return run.dedupe_key.startswith(REVIEW_RECOVERY_DEDUPE_PREFIX)
+
+    def _is_operator_review(self, run: runs_dao.RunRow) -> bool:
+        return run.dedupe_key.startswith(OPERATOR_REVIEW_DEDUPE_PREFIX)
 
     def _recover_stranded_failed_ship(
         self, conn, task: tasks_dao.TaskRow
@@ -1295,11 +1318,17 @@ class LifecycleOrchestrator:
             except StateError:
                 return 0, 0
         prompt = self._review_prompt(task, metadata)
+        # Use operator-review dedupe key when this is an operator-triggered re-review
+        # (existing has prior terminal reviews that _handle_same_sha_review let through).
+        if existing:
+            dedupe_key = f"{OPERATOR_REVIEW_DEDUPE_PREFIX}{task.id}:{review_target_sha}:{task.version}"
+        else:
+            dedupe_key = f"review:{task.id}:{review_target_sha}"
         self._create_dispatch_run(
             conn,
             task,
             kind="review",
-            dedupe_key=f"review:{task.id}:{review_target_sha}",
+            dedupe_key=dedupe_key,
             agent=assignment.agent,
             model=self._review_model if self._review_model else assignment.model,
             review_target_sha=review_target_sha,
@@ -1330,6 +1359,11 @@ class LifecycleOrchestrator:
             return 0, 0
         latest_attempt = max(run.attempt for run in existing)
         if latest_attempt >= 2:
+            # When the operator explicitly resets a blocked task to pr_open, allow
+            # one fresh independent re-review even though prior attempts are exhausted.
+            # Return None to fall through to _ensure_review_run with operator-review key.
+            if task.status == "pr_open":
+                return None
             return 0, 0
         retry_source = max(existing, key=lambda run: (run.attempt, run.created_at))
         if retry_source.status == "succeeded" and retry_source.failure_category not in {

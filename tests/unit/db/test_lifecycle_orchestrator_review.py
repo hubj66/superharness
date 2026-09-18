@@ -1394,3 +1394,241 @@ def test_normal_attempt_2_does_not_create_attempt_3(tmp_path):
         assert tasks_dao.get(conn, "t1").status == "review_requested"
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Operator re-review path
+# ---------------------------------------------------------------------------
+
+
+def _operator_review_setup(conn, *, sha: str = "sha-a") -> None:
+    """Pre-populate two exhausted consumed failed reviews so the operator path fires."""
+    _consumed_exhausted_reviews(conn, sha=sha)
+
+
+def test_operator_review_created_when_pr_open_after_exhausted_attempts(tmp_path):
+    """task.status==pr_open with exhausted reviews -> fresh operator-review run created."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="pr_open", sha="sha-a")
+        _operator_review_setup(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        operator_reviews = [r for r in reviews if r.dedupe_key.startswith("operator-review:")]
+        assert len(operator_reviews) == 1, f"Expected 1 operator review, got {operator_reviews}"
+        assert operator_reviews[0].review_target_sha == "sha-a"
+        assert tasks_dao.get(conn, "t1").status == "review_requested"
+    finally:
+        conn.close()
+
+
+def test_operator_review_uses_distinct_dedupe_key(tmp_path):
+    """Operator review uses operator-review: prefix, not review: prefix."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="pr_open", sha="sha-a")
+        _operator_review_setup(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        operator_reviews = [r for r in reviews if r.dedupe_key.startswith("operator-review:")]
+        assert len(operator_reviews) == 1
+        assert operator_reviews[0].dedupe_key.startswith("operator-review:t1:sha-a:")
+    finally:
+        conn.close()
+
+
+def test_operator_review_not_created_from_review_requested(tmp_path):
+    """task.status==review_requested with exhausted reviews -> no operator review (safety gate)."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _operator_review_setup(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        for _ in range(3):
+            orch.tick("t1")
+
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        operator_reviews = [r for r in reviews if r.dedupe_key.startswith("operator-review:")]
+        assert len(operator_reviews) == 0
+        assert tasks_dao.get(conn, "t1").status in {"review_requested", "blocked"}
+    finally:
+        conn.close()
+
+
+def test_operator_review_is_idempotent(tmp_path):
+    """Multiple ticks do not create duplicate operator reviews."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="pr_open", sha="sha-a")
+        _operator_review_setup(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        for _ in range(5):
+            orch.tick("t1")
+
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        operator_reviews = [r for r in reviews if r.dedupe_key.startswith("operator-review:")]
+        assert len(operator_reviews) == 1
+    finally:
+        conn.close()
+
+
+def test_operator_review_lgtm_moves_to_review_passed(tmp_path):
+    """Successful LGTM from operator review moves task to review_passed."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="pr_open", sha="sha-a")
+        _operator_review_setup(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        op_reviews = [r for r in reviews if r.dedupe_key.startswith("operator-review:")]
+        assert len(op_reviews) == 1
+        op_review = op_reviews[0]
+
+        _complete_review(conn, op_review, verdict="LGTM", sha="sha-a")
+        orch.tick("t1")
+
+        assert tasks_dao.get(conn, "t1").status == "review_passed"
+    finally:
+        conn.close()
+
+
+def test_operator_review_rejected_moves_to_review_failed(tmp_path):
+    """REJECTED from operator review moves task to review_failed."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="pr_open", sha="sha-a")
+        _operator_review_setup(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        op_reviews = [r for r in reviews if r.dedupe_key.startswith("operator-review:")]
+        assert len(op_reviews) == 1
+        op_review = op_reviews[0]
+
+        _complete_review(conn, op_review, verdict="REJECTED", sha="sha-a",
+                         findings=["needs a focused fix"])
+        orch.tick("t1")
+
+        # REJECTED triggers repair run creation, which transitions to in_progress
+        assert tasks_dao.get(conn, "t1").status in {"review_failed", "in_progress"}
+    finally:
+        conn.close()
+
+
+def test_operator_review_terminal_failure_blocks_task(tmp_path):
+    """Non-retriable operator review failure blocks the task immediately."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="pr_open", sha="sha-a")
+        _operator_review_setup(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        op_reviews = [r for r in reviews if r.dedupe_key.startswith("operator-review:")]
+        assert len(op_reviews) == 1
+        op_review = op_reviews[0]
+
+        _fail_review(conn, op_review, category="quota", status="quota_blocked")
+        orch.tick("t1")
+
+        assert tasks_dao.get(conn, "t1").status == "blocked"
+        all_reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        recovery_reviews = [r for r in all_reviews if r.dedupe_key.startswith("review-recovery:")]
+        assert len(recovery_reviews) == 0
+    finally:
+        conn.close()
+
+
+def test_operator_review_any_failure_blocks_task(tmp_path):
+    """Operator review failing with any category blocks task immediately (no retry)."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="pr_open", sha="sha-a")
+        _operator_review_setup(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        op_reviews = [r for r in reviews if r.dedupe_key.startswith("operator-review:")]
+        assert len(op_reviews) == 1
+        op_review = op_reviews[0]
+
+        _fail_review(conn, op_review, category="network")
+        orch.tick("t1")
+
+        # No retry — operator review blocks on any failure
+        assert tasks_dao.get(conn, "t1").status == "blocked"
+        all_reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        assert len(all_reviews) == 3  # 2 exhausted + 1 operator review
+    finally:
+        conn.close()
+
+
+
+
+
+def test_operator_review_does_not_trigger_auto_recovery(tmp_path, monkeypatch):
+    """Exhausted operator review does not create an auto-recovery review."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="pr_open", sha="sha-a")
+        _operator_review_setup(conn)
+        _allow_review_recovery(monkeypatch)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        op_reviews = [r for r in reviews if r.dedupe_key.startswith("operator-review:")]
+        assert len(op_reviews) == 1
+        op_review = op_reviews[0]
+        _fail_review(conn, op_review, category="invalid_result")
+        for _ in range(4):
+            orch.tick("t1")
+
+        all_reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        recovery_reviews = [r for r in all_reviews if r.dedupe_key.startswith("review-recovery:")]
+        assert len(recovery_reviews) == 0
+        assert tasks_dao.get(conn, "t1").status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_operator_review_not_created_when_consumed_valid_verdict_exists(tmp_path):
+    """If a consumed LGTM already exists for the SHA, no operator review is created."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="pr_open", sha="sha-a")
+        # Create a review run and complete it with LGTM (consumed verdict)
+        lgtm_run = runs_dao.create_run(
+            conn,
+            id="review-lgtm-consumed",
+            task_id="t1",
+            kind="review",
+            agent="codex-cli",
+            model="gpt-5.5",
+            attempt=2,
+            dedupe_key="review:t1:sha-a:lgtm",
+            review_target_sha="sha-a",
+            now=NOW,
+        )
+        _complete_review(conn, lgtm_run, verdict="LGTM", sha="sha-a")
+        runs_dao.mark_run_consumed(conn, lgtm_run.id, now=NOW)
+        conn.commit()
+
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        for _ in range(3):
+            orch.tick("t1")
+
+        all_reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        operator_reviews = [r for r in all_reviews if r.dedupe_key.startswith("operator-review:")]
+        assert len(operator_reviews) == 0
+    finally:
+        conn.close()
