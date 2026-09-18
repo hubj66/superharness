@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from superharness.engine import runs_dao, tasks_dao
 from superharness.engine.db import get_connection, init_db
 from superharness.engine.lifecycle_orchestrator import LifecycleOrchestrator
@@ -96,6 +98,64 @@ def test_implementation_success_creates_one_system_ship_run(tmp_path):
         assert ship_runs[0].status == "failed"
         assert task is not None and task.status == "in_progress"
 
+    finally:
+        conn.close()
+
+
+@pytest.mark.regression
+def test_valid_repair_result_at_pr_head_creates_ship_without_redefining_base(tmp_path):
+    """A repair at PR head A remains shippable when its result also reports A."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn)
+        repair = runs_dao.create_run(
+            conn,
+            id="repair-t1",
+            task_id="t1",
+            kind="repair",
+            agent="claude-code",
+            dedupe_key="repair:t1:review-t1",
+            worktree_path="/tmp/superharness-worktrees/reliable/project/t1",
+            branch_name="shux/reliable/t1",
+            base_sha="sha-a",
+            head_sha="sha-a",
+            now=NOW,
+        )
+        runs_dao.transition_run(conn, repair.id, to_status="claimed", now=NOW)
+        runs_dao.transition_run(conn, repair.id, to_status="running", now=NOW)
+        runs_dao.record_run_result(
+            conn,
+            repair.id,
+            {
+                "schema_version": 1,
+                "run_id": repair.id,
+                "task_id": repair.task_id,
+                "kind": repair.kind,
+                "agent": repair.agent,
+                "exit_code": 0,
+                "completion_status": "completed",
+                "worktree_path": repair.worktree_path,
+                "branch_name": repair.branch_name,
+                "base_sha": "sha-a",
+                "head_sha": "sha-a",
+                "dirty": True,
+                "changed_files": ["src/fixed.py"],
+            },
+            now=NOW,
+        )
+        runs_dao.transition_run(conn, repair.id, to_status="succeeded", now=NOW)
+        conn.commit()
+
+        LifecycleOrchestrator(str(project), now=lambda: NOW).tick("t1")
+
+        persisted_repair = runs_dao.get_run(conn, repair.id)
+        ship_runs = runs_dao.list_runs_for_task(conn, "t1", kind="ship")
+        assert persisted_repair is not None
+        assert persisted_repair.base_sha == "sha-a"
+        assert persisted_repair.head_sha == "sha-a"
+        assert len(ship_runs) == 1
+        assert ship_runs[0].parent_run_id == repair.id
+        assert ship_runs[0].base_sha == "sha-a"
     finally:
         conn.close()
 

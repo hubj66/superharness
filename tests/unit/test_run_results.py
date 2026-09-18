@@ -42,6 +42,10 @@ def test_generated_minimal_example_validates_for_each_reliable_kind(kind):
         kind=kind,
         agent="codex-cli" if kind == "review" else "claude-code",
         review_target_sha="sha-review" if kind == "review" else None,
+        worktree_path="/tmp/worktree",
+        branch_name="shux/reliable/task-1",
+        base_sha="sha-base",
+        head_sha="sha-head",
     )
     assert ExecutionResult.model_validate(json.loads(json.dumps(artifact)))
     assert set(RESULT_FIELD_JSON_TYPES) == set(ExecutionResult.model_fields)
@@ -52,5 +56,13 @@ def test_generated_minimal_example_validates_for_each_reliable_kind(kind):
         agent="codex-cli" if kind == "review" else "claude-code",
         artifact_path="/tmp/result.json",
         review_target_sha="sha-review" if kind == "review" else None,
+        worktree_path="/tmp/worktree",
+        branch_name="shux/reliable/task-1",
+        base_sha="sha-base",
+        head_sha="sha-head",
     )
     assert json.dumps(artifact, indent=2) in prompt
+    if kind != "review":
+        assert "Run git identity is authoritative" in prompt
+        assert '"base_sha": "sha-base"' in prompt
+        assert prompt.count('"base_sha": "sha-base"') == 2

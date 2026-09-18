@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -11,6 +10,12 @@ from superharness.engine.state_errors import BoundaryError
 RUN_KINDS = frozenset({"plan", "implement", "repair", "fallback", "ship", "review"})
 REVIEW_VERDICTS = frozenset({"LGTM", "REJECTED"})
 COMPLETION_STATUSES = frozenset({"completed", "blocked", "needs_input", "failed"})
+RUN_GIT_IDENTITY_FIELDS = (
+    "worktree_path",
+    "branch_name",
+    "base_sha",
+    "head_sha",
+)
 
 RunKind = Literal["plan", "implement", "repair", "fallback", "ship", "review"]
 CompletionStatus = Literal["completed", "blocked", "needs_input", "failed"]
@@ -106,6 +111,10 @@ def minimal_execution_result_example(
     kind: str,
     agent: str,
     review_target_sha: str | None = None,
+    worktree_path: str | None = None,
+    branch_name: str | None = None,
+    base_sha: str | None = None,
+    head_sha: str | None = None,
 ) -> dict[str, Any]:
     """Build a minimal valid completed result from the ExecutionResult contract."""
     payload: dict[str, Any] = {
@@ -129,10 +138,10 @@ def minimal_execution_result_example(
     else:
         payload.update(
             {
-                "worktree_path": "/path/to/managed/worktree",
-                "branch_name": "shux/reliable/example",
-                "base_sha": "base-sha",
-                "head_sha": "head-sha",
+                "worktree_path": worktree_path or "/path/to/managed/worktree",
+                "branch_name": branch_name or "shux/reliable/example",
+                "base_sha": base_sha or "base-sha",
+                "head_sha": head_sha or "head-sha",
                 "dirty": False,
             }
         )
@@ -147,6 +156,10 @@ def reliable_result_instructions(
     agent: str,
     artifact_path: str | None,
     review_target_sha: str | None = None,
+    worktree_path: str | None = None,
+    branch_name: str | None = None,
+    base_sha: str | None = None,
+    head_sha: str | None = None,
 ) -> str:
     """Render the prompt contract from the authoritative result model."""
     fields = ", ".join(ExecutionResult.model_fields)
@@ -160,6 +173,10 @@ def reliable_result_instructions(
         kind=kind,
         agent=agent,
         review_target_sha=review_target_sha,
+        worktree_path=worktree_path,
+        branch_name=branch_name,
+        base_sha=base_sha,
+        head_sha=head_sha,
     )
     lines = [
         "Structured result contract:",
@@ -186,7 +203,7 @@ def reliable_result_instructions(
         lines.extend(
             [
                 f"Set reviewed_sha exactly to {review_target_sha or 'the required review target SHA'}.",
-                'For completed reviews, review_verdict must be LGTM or REJECTED, as a JSON string.',
+                "For completed reviews, review_verdict must be LGTM or REJECTED, as a JSON string.",
                 "findings must be a JSON array of strings; use [] for LGTM and concrete string entries for REJECTED.",
             ]
         )
@@ -194,7 +211,27 @@ def reliable_result_instructions(
         lines.append(
             "For completed Runs, worktree_path and branch_name must be JSON strings; base_sha and head_sha must be JSON strings; dirty must be a JSON boolean. changed_files and findings must be JSON arrays of strings."
         )
-    lines.append("The artifact is the only reliable result handoff; stdout alone is not sufficient.")
+        authoritative_identity = {
+            "worktree_path": worktree_path,
+            "branch_name": branch_name,
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+        }
+        known_identity = {
+            key: value
+            for key, value in authoritative_identity.items()
+            if value is not None
+        }
+        if known_identity:
+            lines.extend(
+                [
+                    "The orchestrator-created Run git identity is authoritative. Report these fields exactly; do not derive or redefine them:",
+                    json.dumps(known_identity, indent=2),
+                ]
+            )
+    lines.append(
+        "The artifact is the only reliable result handoff; stdout alone is not sufficient."
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -230,6 +267,19 @@ def validate_result_for_run(
     if mismatches:
         raise BoundaryError(
             "Execution result does not match run: " + "; ".join(mismatches)
+        )
+
+    identity_mismatches = [
+        f"{field}: expected {getattr(run, field)!r}, got {getattr(result, field)!r}"
+        for field in RUN_GIT_IDENTITY_FIELDS
+        if getattr(run, field, None) is not None
+        and getattr(result, field) is not None
+        and getattr(result, field) != getattr(run, field)
+    ]
+    if identity_mismatches:
+        raise BoundaryError(
+            "Execution result git identity does not match authoritative run: "
+            + "; ".join(identity_mismatches)
         )
 
     expected_review_sha = getattr(run, "review_target_sha", None)

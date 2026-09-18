@@ -611,6 +611,9 @@ def test_implement_artifact_must_match_authoritative_result_contract(
 ):
     project, conn = _project(tmp_path)
     try:
+        artifact = dict(artifact)
+        if expected_status == "succeeded":
+            artifact["worktree_path"] = str(project)
         _sqlite_claim_next(str(project), "claude-code", NOW)
         ctx = DispatchContext(
             project_dir=str(project),
@@ -642,5 +645,76 @@ def test_implement_artifact_must_match_authoritative_result_contract(
         assert run.status == expected_status
         if expected_status == "failed":
             assert run.failure_category == "invalid_result"
+    finally:
+        conn.close()
+
+
+@pytest.mark.regression
+def test_repair_artifact_with_unrelated_base_cannot_corrupt_run_or_ship(tmp_path):
+    """gh-253: repair base B cannot replace authoritative PR-head base A."""
+    project, conn = _project(tmp_path)
+    try:
+        conn.execute(
+            """
+            UPDATE runs
+               SET kind='repair',
+                   branch_name='shux/reliable/t1',
+                   base_sha='sha-a',
+                   head_sha='sha-a'
+             WHERE id='run-1'
+            """
+        )
+        conn.commit()
+        _sqlite_claim_next(str(project), "claude-code", NOW)
+        ctx = DispatchContext(
+            project_dir=str(project),
+            inbox_file=str(project / ".superharness" / "inbox.yaml"),
+            contract_file=str(project / ".superharness" / "contract.yaml"),
+            print_only=False,
+            non_interactive=True,
+            codex_bypass=False,
+            launcher_timeout=0,
+            script_dir=str(project),
+            sqlite_primary=True,
+            item_id="inbox-1",
+            item_task="t1",
+            item_to="claude-code",
+            item_project=str(project),
+            exec_project=str(project),
+            run_id="run-1",
+            item={"plan_only": False},
+        )
+        _prepare_execution(ctx)
+        Path(ctx.spawn_env["SUPERHARNESS_RUN_RESULT_PATH"]).write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": "run-1",
+                    "task_id": "t1",
+                    "kind": "repair",
+                    "agent": "claude-code",
+                    "exit_code": 0,
+                    "completion_status": "completed",
+                    "worktree_path": str(project),
+                    "branch_name": "shux/reliable/t1",
+                    "base_sha": "sha-b",
+                    "head_sha": "sha-a",
+                    "dirty": True,
+                    "changed_files": ["src/fixed.py"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        _reliable_run_started(ctx, pid=None)
+        ctx.launcher_rc = 0
+        _reliable_run_finished(ctx)
+
+        run = runs_dao.get_run(conn, "run-1")
+        assert run is not None
+        assert run.status == "failed"
+        assert run.failure_category == "invalid_result"
+        assert run.base_sha == "sha-a"
+        assert run.head_sha == "sha-a"
+        assert runs_dao.list_runs_for_task(conn, "t1", kind="ship") == []
     finally:
         conn.close()

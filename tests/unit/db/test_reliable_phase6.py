@@ -665,6 +665,7 @@ def test_plan_uses_managed_worktree(tmp_path, monkeypatch):
         assert plans[0].worktree_path == FakeWorktree.path
         assert plans[0].branch_name == FakeWorktree.branch_name
         assert plans[0].base_sha == FakeWorktree.base_sha
+        assert plans[0].head_sha == FakeWorktree.base_sha
         assert plans[0].model == "claude-sonnet-4-6"
     finally:
         conn.close()

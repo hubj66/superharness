@@ -356,10 +356,6 @@ def record_run_result(
     updates: dict[str, Any] = {
         "exit_code": parsed.exit_code,
         "result_json": json.dumps(result_payload),
-        "worktree_path": parsed.worktree_path,
-        "branch_name": parsed.branch_name,
-        "base_sha": parsed.base_sha,
-        "head_sha": parsed.head_sha,
         "review_verdict": parsed.review_verdict,
     }
     if result_handoff_id is not None:

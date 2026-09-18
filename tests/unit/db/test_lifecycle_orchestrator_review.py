@@ -131,7 +131,7 @@ def _fail_review(
     conn.commit()
 
 
-def _complete_repair(conn, run: runs_dao.RunRow, *, head: str = "repair-head") -> None:
+def _complete_repair(conn, run: runs_dao.RunRow) -> None:
     runs_dao.transition_run(conn, run.id, to_status="claimed", now=NOW)
     runs_dao.transition_run(conn, run.id, to_status="running", now=NOW)
     runs_dao.record_run_result(
@@ -148,7 +148,7 @@ def _complete_repair(conn, run: runs_dao.RunRow, *, head: str = "repair-head") -
             "worktree_path": run.worktree_path or "/tmp/superharness-worktrees/t1",
             "branch_name": run.branch_name or "shux/reliable/t1",
             "base_sha": run.base_sha or "sha-a",
-            "head_sha": head,
+            "head_sha": run.head_sha or run.base_sha or "sha-a",
             "dirty": True,
         },
         now=NOW,

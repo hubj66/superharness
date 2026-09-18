@@ -1083,6 +1083,7 @@ class LifecycleOrchestrator:
             worktree_path = worktree.path
             branch_name = worktree.branch_name
             base_sha = worktree.base_sha
+            head_sha = worktree.base_sha
         run_id = "run-" + hashlib.sha256(dedupe_key.encode()).hexdigest()[:24]
         run = runs_dao.create_run(
             conn,

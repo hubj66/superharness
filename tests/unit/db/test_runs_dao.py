@@ -305,8 +305,70 @@ def test_structured_result_valid(db_conn):
     )
 
     assert updated.exit_code == 0
-    assert updated.head_sha == "head"
+    assert updated.head_sha is None
+    assert updated.result_json["head_sha"] == "head"
     assert updated.result_json["run_id"] == run.id
+
+
+@pytest.mark.regression
+@pytest.mark.parametrize("kind", ["plan", "implement", "repair", "fallback", "review"])
+@pytest.mark.parametrize(
+    ("field", "conflicting_value"),
+    [
+        ("worktree_path", "/tmp/unrelated-worktree"),
+        ("branch_name", "unrelated/branch"),
+        ("base_sha", "sha-b"),
+        ("head_sha", "sha-b"),
+    ],
+)
+def test_result_cannot_replace_authoritative_run_git_identity(
+    db_conn, kind, field, conflicting_value
+):
+    """Agent artifacts cannot redefine orchestrator-owned Run git identity."""
+    _make_task(db_conn)
+    review_target_sha = "sha-a" if kind == "review" else None
+    run = runs_dao.create_run(
+        db_conn,
+        id="r1",
+        task_id="t1",
+        kind=kind,
+        agent="codex-cli" if kind == "review" else "claude-code",
+        dedupe_key="r1",
+        worktree_path="/tmp/authoritative-worktree",
+        branch_name="shux/reliable/t1",
+        base_sha="sha-a",
+        head_sha="sha-a",
+        review_target_sha=review_target_sha,
+        now=T0,
+    )
+    result = {
+        "schema_version": 1,
+        "run_id": run.id,
+        "task_id": run.task_id,
+        "kind": run.kind,
+        "agent": run.agent,
+        "exit_code": 0,
+        "completion_status": "completed",
+        "worktree_path": run.worktree_path,
+        "branch_name": run.branch_name,
+        "base_sha": run.base_sha,
+        "head_sha": run.head_sha,
+        "dirty": False,
+    }
+    if kind == "review":
+        result.update(review_verdict="LGTM", reviewed_sha=review_target_sha)
+    result[field] = conflicting_value
+
+    with pytest.raises(BoundaryError, match=field):
+        runs_dao.record_run_result(db_conn, run.id, result, now=T1)
+
+    persisted = runs_dao.get_run(db_conn, run.id)
+    assert persisted is not None
+    assert persisted.worktree_path == run.worktree_path
+    assert persisted.branch_name == run.branch_name
+    assert persisted.base_sha == "sha-a"
+    assert persisted.head_sha == "sha-a"
+    assert persisted.result_json == {}
 
 
 def test_mismatched_run_id_rejected(db_conn):

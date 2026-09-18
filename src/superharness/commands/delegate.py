@@ -168,11 +168,15 @@ def _build_reliable_task_execution_prompt(
     run_id: str,
     run_kind: str,
     review_target_sha: str | None,
+    worktree_path: str | None,
+    branch_name: str | None,
+    base_sha: str | None,
+    head_sha: str | None,
     acceptance_criteria: str,
     context_hint: str,
     user_instructions: str,
     auto_directive: str,
-    result_path: str | None = None
+    result_path: str | None = None,
 ) -> str:
     """Build the agent contract for one durable reliable-orchestrator Run.
 
@@ -191,9 +195,18 @@ def _build_reliable_task_execution_prompt(
         "invoke /ship, or close the task.\n"
     )
     from superharness.engine.run_results import reliable_result_instructions
+
     result_contract = reliable_result_instructions(
-        run_id=run_id, task_id=task_id, kind=run_kind, agent=target,
-        artifact_path=result_path, review_target_sha=review_target_sha,
+        run_id=run_id,
+        task_id=task_id,
+        kind=run_kind,
+        agent=target,
+        artifact_path=result_path,
+        review_target_sha=review_target_sha,
+        worktree_path=worktree_path,
+        branch_name=branch_name,
+        base_sha=base_sha,
+        head_sha=head_sha,
     )
 
     if run_kind == "plan":
@@ -1554,6 +1567,10 @@ def delegate(
                 run_id=reliable_run.id,
                 run_kind=reliable_run.kind,
                 review_target_sha=reliable_run.review_target_sha,
+                worktree_path=reliable_run.worktree_path,
+                branch_name=reliable_run.branch_name,
+                base_sha=reliable_run.base_sha,
+                head_sha=reliable_run.head_sha,
                 result_path=result_path or None,
                 acceptance_criteria=acceptance_criteria,
                 context_hint=context_hint,
