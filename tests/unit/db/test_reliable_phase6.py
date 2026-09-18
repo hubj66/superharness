@@ -167,23 +167,23 @@ def _finish_review(
 ) -> None:
     runs_dao.transition_run(conn, review.id, to_status="claimed", now=NOW)
     runs_dao.transition_run(conn, review.id, to_status="running", now=NOW)
-    runs_dao.record_run_result(
-        conn,
-        review.id,
-        {
-            "schema_version": 1,
-            "run_id": review.id,
-            "task_id": review.task_id,
-            "kind": "review",
-            "agent": review.agent,
-            "exit_code": 0,
-            "completion_status": "completed",
-            "review_verdict": verdict,
-            "reviewed_sha": sha,
-            "findings": ["needs a focused fix"],
-        },
-        now=NOW,
-    )
+    payload: dict = {
+        "schema_version": 1,
+        "run_id": review.id,
+        "task_id": review.task_id,
+        "kind": "review",
+        "agent": review.agent,
+        "exit_code": 0,
+        "completion_status": "completed",
+        "review_verdict": verdict,
+        "reviewed_sha": sha,
+        "findings": ["needs a focused fix"],
+    }
+    for field in ("worktree_path", "branch_name", "base_sha", "head_sha"):
+        value = getattr(review, field, None)
+        if value is not None:
+            payload[field] = value
+    runs_dao.record_run_result(conn, review.id, payload, now=NOW)
     runs_dao.transition_run(conn, review.id, to_status="succeeded", now=NOW)
     conn.commit()
 

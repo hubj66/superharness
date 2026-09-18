@@ -1143,8 +1143,11 @@ def _reliable_run_finished(ctx: DispatchContext) -> None:
                 )
                 run = runs_dao.get_run(conn, run.id) or run
             result_snapshot = dict(snapshot)
+            # worktree_path is always known from context; include it for both
+            # success and failure so the fallback payload satisfies strict
+            # identity validation when the run row has it set.
+            result_snapshot["worktree_path"] = ctx.exec_project or ctx.project_dir
             if success:
-                result_snapshot["worktree_path"] = ctx.exec_project or ctx.project_dir
                 for key in ("branch_name", "base_sha", "head_sha"):
                     if not result_snapshot.get(key):
                         result_snapshot[key] = "unknown"

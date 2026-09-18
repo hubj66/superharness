@@ -386,6 +386,8 @@ def test_linked_review_run_ingests_structured_result_artifact(
                     "review_verdict": verdict,
                     "reviewed_sha": "sha-a",
                     "findings": findings,
+                    # Echo authoritative worktree_path stamped by _reliable_run_started.
+                    "worktree_path": ctx.exec_project,
                 }
             ),
             encoding="utf-8",

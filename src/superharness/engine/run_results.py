@@ -135,6 +135,22 @@ def minimal_execution_result_example(
                 "reviewed_sha": review_target_sha or "required-review-target-sha",
             }
         )
+        # Include authoritative git identity in the review example so the model
+        # echoes the exact persisted values instead of deriving them from git history.
+        # For review runs base_sha = head_sha = review_target_sha.
+        auth_review_sha = base_sha or review_target_sha
+        review_git: dict[str, Any] = {
+            k: v
+            for k, v in {
+                "worktree_path": worktree_path,
+                "branch_name": branch_name,
+                "base_sha": auth_review_sha,
+                "head_sha": head_sha or auth_review_sha,
+            }.items()
+            if v is not None
+        }
+        if review_git:
+            payload.update(review_git)
     else:
         payload.update(
             {
@@ -221,6 +237,26 @@ def reliable_result_instructions(
                 "findings must be a JSON array of strings; use [] for LGTM and concrete string entries for REJECTED.",
             ]
         )
+        auth_review_sha = base_sha or review_target_sha
+        review_identity = {
+            k: v
+            for k, v in {
+                "worktree_path": worktree_path,
+                "branch_name": branch_name,
+                "base_sha": auth_review_sha,
+                "head_sha": head_sha or auth_review_sha,
+            }.items()
+            if v is not None
+        }
+        if review_identity:
+            lines.extend(
+                [
+                    "The orchestrator-created Run git identity is authoritative. Report these fields exactly; do not derive or redefine them:",
+                    json.dumps(review_identity, indent=2),
+                    "IMPORTANT: base_sha and head_sha are NOT derived from git merge-base, PR history, or repository inspection.",
+                    "They are authoritative values stamped by Superharness on this Run. DO NOT replace them with values from git.",
+                ]
+            )
     elif kind in {"plan", "implement", "repair", "fallback"}:
         lines.append(
             "For completed Runs, worktree_path and branch_name must be JSON strings; base_sha and head_sha must be JSON strings; dirty must be a JSON boolean. changed_files and findings must be JSON arrays of strings."
@@ -283,11 +319,13 @@ def validate_result_for_run(
             "Execution result does not match run: " + "; ".join(mismatches)
         )
 
+    # When the authoritative Run has a non-None value the result must echo it
+    # exactly.  A null/omitted result field is NOT a safe bypass: it is still
+    # a mismatch because the orchestrator stamped a concrete value on this Run.
     identity_mismatches = [
         f"{field}: expected {getattr(run, field)!r}, got {getattr(result, field)!r}"
         for field in RUN_GIT_IDENTITY_FIELDS
         if getattr(run, field, None) is not None
-        and getattr(result, field) is not None
         and getattr(result, field) != getattr(run, field)
     ]
     if identity_mismatches:

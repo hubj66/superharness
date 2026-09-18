@@ -106,6 +106,11 @@ def _complete_review(
     }
     if sha is not None:
         payload["reviewed_sha"] = sha
+    # Echo authoritative identity so strict validate_result_for_run passes.
+    for field in ("worktree_path", "branch_name", "base_sha", "head_sha"):
+        value = getattr(run, field, None)
+        if value is not None:
+            payload[field] = value
     runs_dao.record_run_result(conn, run.id, payload, now=NOW)
     runs_dao.transition_run(conn, run.id, to_status="succeeded", now=NOW)
     conn.commit()
