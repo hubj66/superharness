@@ -1149,7 +1149,7 @@ def _reliable_run_finished(ctx: DispatchContext) -> None:
                     if not result_snapshot.get(key):
                         result_snapshot[key] = "unknown"
                 result_snapshot.setdefault("dirty", False)
-            artifact_payload = _load_run_result_artifact(ctx)
+            artifact_payload, artifact_error = _load_run_result_artifact(ctx)
             payload = artifact_payload or {
                 "schema_version": 1,
                 "run_id": run.id,
@@ -1163,13 +1163,17 @@ def _reliable_run_finished(ctx: DispatchContext) -> None:
             try:
                 runs_dao.record_run_result(conn, run.id, payload, now=_now_utc())
                 result_valid = True
+                result_error = None
             except (BoundaryError, ValueError, TypeError) as exc:
                 result_valid = False
+                result_error = artifact_error or (
+                    f"structured Run result failed validation: {exc}"
+                )
                 runs_dao.record_run_diagnostic(
                     conn,
                     run.id,
-                    failure_category="invalid_run_result",
-                    failure_detail=str(exc),
+                    failure_category="invalid_result",
+                    failure_detail=result_error,
                 )
             terminal_success = success and result_valid
             if terminal_success:
@@ -1186,11 +1190,14 @@ def _reliable_run_finished(ctx: DispatchContext) -> None:
                     timed_out=ctx.launcher_rc == 124,
                 )
                 terminal_category = classification.category
-                terminal_detail = (
-                    classification.explain
-                    if success
-                    else f"{classification.explain}: exit code {ctx.launcher_rc}"
-                )
+                if success and not result_valid:
+                    terminal_detail = result_error
+                else:
+                    terminal_detail = (
+                        classification.explain
+                        if success
+                        else f"{classification.explain}: exit code {ctx.launcher_rc}"
+                    )
                 terminal_status = {
                     "agent_crash": "crashed",
                     "lost_process": "crashed",
@@ -1241,16 +1248,24 @@ def _reliable_log_tail(path: str, lines: int = 50) -> str:
         return ""
 
 
-def _load_run_result_artifact(ctx: DispatchContext) -> dict[str, object] | None:
+def _load_run_result_artifact(
+    ctx: DispatchContext,
+) -> tuple[dict[str, object] | None, str | None]:
     path = ctx.spawn_env.get("SUPERHARNESS_RUN_RESULT_PATH", "")
-    if not path or not os.path.isfile(path):
-        return None
+    if not path:
+        return None, "structured Run result path was not configured"
+    if not os.path.isfile(path):
+        return None, f"structured Run result artifact was not created at {path}"
     try:
         with open(path, encoding="utf-8") as handle:
             payload = json.load(handle)
-        return payload if isinstance(payload, dict) else None
-    except (OSError, json.JSONDecodeError):
-        return None
+    except OSError as exc:
+        return None, f"structured Run result artifact could not be read: {exc}"
+    except json.JSONDecodeError as exc:
+        return None, f"structured Run result artifact contained malformed JSON: {exc}"
+    if not isinstance(payload, dict):
+        return None, "structured Run result artifact must contain one JSON object"
+    return payload, None
 
 
 def _transition_to_launched(ctx: DispatchContext, lock: _MkdirLock) -> int | None:

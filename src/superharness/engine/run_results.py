@@ -178,23 +178,37 @@ def reliable_result_instructions(
         base_sha=base_sha,
         head_sha=head_sha,
     )
-    lines = [
-        "Structured result contract:",
-        f"Write exactly one JSON object to {artifact_path or 'SUPERHARNESS_RUN_RESULT_PATH'}.",
-        f"The JSON fields are: {fields}.",
-        f"JSON field types: {field_types}.",
-        f"Set run_id exactly to {run_id}.",
-        f"Set task_id exactly to {task_id}.",
-        f"Set kind exactly to {kind}.",
-        f"Set agent exactly to {agent}.",
-        'schema_version must be the JSON integer 1, written as: "schema_version": 1. Do not quote it.',
-        "completion_status must be one of: completed, blocked, needs_input, failed; it is a JSON string.",
-        'For a successful completed Run, set completion_status to the JSON string "completed" and exit_code to the JSON integer 0.',
-        "For a non-successful Run, record the actual JSON integer non-zero exit_code and matching completion_status.",
-        "Do not use custom fields such as status, summary, files_changed, or test_results.",
-        "Minimal valid JSON example for this Run kind:",
-        json.dumps(example, indent=2),
-    ]
+    lines = ["Structured result contract:"]
+    if agent == "codex-cli":
+        lines.extend(
+            [
+                "Your final response must be exactly one JSON object matching this contract.",
+                f"The Codex launcher writes that final response to {artifact_path or 'SUPERHARNESS_RUN_RESULT_PATH'} using --output-last-message.",
+                "Do not write the artifact with a shell command or file-editing tool.",
+                "Do not wrap the JSON in Markdown fences and do not include prose outside the JSON object.",
+            ]
+        )
+    else:
+        lines.append(
+            f"Write exactly one JSON object to {artifact_path or 'SUPERHARNESS_RUN_RESULT_PATH'}."
+        )
+    lines.extend(
+        [
+            f"The JSON fields are: {fields}.",
+            f"JSON field types: {field_types}.",
+            f"Set run_id exactly to {run_id}.",
+            f"Set task_id exactly to {task_id}.",
+            f"Set kind exactly to {kind}.",
+            f"Set agent exactly to {agent}.",
+            'schema_version must be the JSON integer 1, written as: "schema_version": 1. Do not quote it.',
+            "completion_status must be one of: completed, blocked, needs_input, failed; it is a JSON string.",
+            'For a successful completed Run, set completion_status to the JSON string "completed" and exit_code to the JSON integer 0.',
+            "For a non-successful Run, record the actual JSON integer non-zero exit_code and matching completion_status.",
+            "Do not use custom fields such as status, summary, files_changed, or test_results.",
+            "Minimal valid JSON example for this Run kind:",
+            json.dumps(example, indent=2),
+        ]
+    )
     if kind == "plan":
         lines.append(
             "ExecutionResult has no plan, summary, details, or metadata field; do not put a plan object in findings. Plan detail is outside the durable Run result contract."

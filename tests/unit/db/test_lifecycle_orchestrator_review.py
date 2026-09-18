@@ -4,6 +4,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from superharness.engine import agent_availability, inbox_dao, runs_dao, tasks_dao
 from superharness.engine.db import get_connection, init_db
 from superharness.engine.lifecycle_orchestrator import LifecycleOrchestrator
@@ -223,6 +225,53 @@ def _failed_unsafe_repair_ship(conn) -> runs_dao.RunRow:
     return runs_dao.get_run(conn, ship.id) or ship
 
 
+def _consumed_exhausted_reviews(
+    conn, *, category: str = "invalid_result", sha: str = "sha-a"
+) -> tuple[runs_dao.RunRow, runs_dao.RunRow]:
+    runs = []
+    parent_id = None
+    for attempt in (1, 2):
+        run = runs_dao.create_run(
+            conn,
+            id=f"review-exhausted-{attempt}",
+            task_id="t1",
+            kind="review",
+            agent="codex-cli",
+            model="gpt-5.5",
+            attempt=attempt,
+            dedupe_key=f"review:t1:{sha}:attempt-{attempt}",
+            parent_run_id=parent_id,
+            trigger_run_id=parent_id,
+            review_target_sha=sha,
+            now=NOW,
+        )
+        runs_dao.transition_run(conn, run.id, to_status="claimed", now=NOW)
+        runs_dao.transition_run(conn, run.id, to_status="running", now=NOW)
+        runs_dao.transition_run(
+            conn,
+            run.id,
+            to_status="failed",
+            now=NOW,
+            failure_category=category,
+            failure_detail=category,
+        )
+        runs_dao.mark_run_consumed(conn, run.id, now=NOW)
+        runs.append(runs_dao.get_run(conn, run.id) or run)
+        parent_id = run.id
+    conn.commit()
+    return runs[0], runs[1]
+
+
+def _allow_review_recovery(monkeypatch, path: str = "/tmp/review-sha-a") -> None:
+    monkeypatch.setattr(LifecycleOrchestrator, "_is_git_repo", lambda self: True)
+    monkeypatch.setattr(
+        "superharness.engine.lifecycle_orchestrator.create_review_worktree",
+        lambda project_dir, task_id, branch_name, review_target_sha: ManagedWorktree(
+            path, None, review_target_sha
+        ),
+    )
+
+
 def test_pr_open_creates_one_codex_review_for_exact_sha(tmp_path):
     project, conn = _project(tmp_path)
     try:
@@ -239,6 +288,14 @@ def test_pr_open_creates_one_codex_review_for_exact_sha(tmp_path):
         assert runs[0].review_target_sha == "sha-a"
         assert "Review only" in runs[0].result_json["prompt"]
         assert "PR description" in runs[0].result_json["prompt"]
+        assert (
+            "dispatcher-provided structured result contract"
+            in runs[0].result_json["prompt"]
+        )
+        assert (
+            "review_verdict must be LGTM or REJECTED" in runs[0].result_json["prompt"]
+        )
+        assert "reviewed_sha must exactly equal" in runs[0].result_json["prompt"]
         assert len(inbox) == 1 and inbox[0].run_id == runs[0].id
         assert task is not None and task.status == "review_requested"
     finally:
@@ -850,5 +907,169 @@ def test_ship_failure_without_safe_recovery_class_blocks_task(tmp_path):
         assert task is not None and task.status == "blocked"
         assert "push_failed" in (task.pause_reason or "")
         assert runs_dao.list_active_runs(conn, task_id="t1") == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.regression
+def test_exhausted_invalid_reviews_create_one_exact_sha_recovery(
+    tmp_path, monkeypatch
+):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _first, second = _consumed_exhausted_reviews(conn)
+        _allow_review_recovery(monkeypatch)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+
+        first_tick = orch.tick("t1")
+        second_tick = orch.tick("t1")
+
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        recovery = next(run for run in reviews if run.attempt == 3)
+        assert len(reviews) == 3
+        assert first_tick.runs_created == 1
+        assert second_tick.runs_created == 0
+        assert recovery.dedupe_key == (
+            f"review-recovery:t1:sha-a:{second.id}"
+        )
+        assert recovery.parent_run_id == second.id
+        assert recovery.trigger_run_id == second.id
+        assert recovery.review_target_sha == "sha-a"
+        assert recovery.base_sha == "sha-a"
+        assert recovery.head_sha == "sha-a"
+        assert recovery.agent == "codex-cli"
+        assert recovery.model == "gpt-5.5"
+        assert recovery.worktree_path == "/tmp/review-sha-a"
+    finally:
+        conn.close()
+
+
+def test_recovery_review_lgtm_advances_normally(tmp_path, monkeypatch):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _consumed_exhausted_reviews(conn)
+        _allow_review_recovery(monkeypatch)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        recovery = runs_dao.list_runs_for_task(conn, "t1", kind="review")[-1]
+
+        _complete_review(conn, recovery, verdict="LGTM", sha="sha-a")
+        orch.tick("t1")
+
+        assert tasks_dao.get(conn, "t1").status == "review_passed"
+    finally:
+        conn.close()
+
+
+def test_recovery_review_rejected_enters_repair_flow(tmp_path, monkeypatch):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _consumed_exhausted_reviews(conn)
+        _allow_review_recovery(monkeypatch)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        recovery = runs_dao.list_runs_for_task(conn, "t1", kind="review")[-1]
+        monkeypatch.setattr(LifecycleOrchestrator, "_is_git_repo", lambda self: False)
+
+        _complete_review(
+            conn,
+            recovery,
+            verdict="REJECTED",
+            sha="sha-a",
+            findings=["Ruff violations remain"],
+        )
+        orch.tick("t1")
+
+        repairs = runs_dao.list_runs_for_task(conn, "t1", kind="repair")
+        assert tasks_dao.get(conn, "t1").status == "in_progress"
+        assert len(repairs) == 1
+        assert repairs[0].trigger_run_id == recovery.id
+    finally:
+        conn.close()
+
+
+def test_recovery_invalid_result_blocks_instead_of_retrying(tmp_path, monkeypatch):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _consumed_exhausted_reviews(conn)
+        _allow_review_recovery(monkeypatch)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        recovery = runs_dao.list_runs_for_task(conn, "t1", kind="review")[-1]
+
+        _fail_review(conn, recovery, category="invalid_result")
+        orch.tick("t1")
+        orch.tick("t1")
+
+        task = tasks_dao.get(conn, "t1")
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        assert task is not None and task.status == "blocked"
+        assert "recovery review" in (task.pause_reason or "")
+        assert len(reviews) == 3
+    finally:
+        conn.close()
+
+
+def test_review_recovery_remote_head_mismatch_blocks(tmp_path, monkeypatch):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _consumed_exhausted_reviews(conn)
+        monkeypatch.setattr(LifecycleOrchestrator, "_is_git_repo", lambda self: True)
+
+        def mismatch(*args, **kwargs):
+            raise StateError("Remote origin/task is sha-b, not sha-a")
+
+        monkeypatch.setattr(
+            "superharness.engine.lifecycle_orchestrator.create_review_worktree",
+            mismatch,
+        )
+        LifecycleOrchestrator(str(project), now=lambda: NOW).tick("t1")
+
+        task = tasks_dao.get(conn, "t1")
+        assert task is not None and task.status == "blocked"
+        assert "sha-b, not sha-a" in (task.pause_reason or "")
+        assert len(runs_dao.list_runs_for_task(conn, "t1", kind="review")) == 2
+    finally:
+        conn.close()
+
+
+def test_review_recovery_missing_pr_metadata_blocks(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _consumed_exhausted_reviews(conn)
+        task = tasks_dao.get(conn, "t1")
+        assert task is not None
+        tasks_dao.update(conn, task.id, task.version, {"extras_json": "{}"})
+        conn.commit()
+
+        LifecycleOrchestrator(str(project), now=lambda: NOW).tick("t1")
+
+        task = tasks_dao.get(conn, "t1")
+        assert task is not None and task.status == "blocked"
+        assert "missing authoritative task PR metadata" in (task.pause_reason or "")
+    finally:
+        conn.close()
+
+
+def test_exhausted_non_invalid_reviews_do_not_use_special_recovery(
+    tmp_path, monkeypatch
+):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _consumed_exhausted_reviews(conn, category="network")
+        _allow_review_recovery(monkeypatch)
+
+        result = LifecycleOrchestrator(str(project), now=lambda: NOW).tick("t1")
+
+        assert result.runs_created == 0
+        assert tasks_dao.get(conn, "t1").status == "review_requested"
+        assert len(runs_dao.list_runs_for_task(conn, "t1", kind="review")) == 2
     finally:
         conn.close()

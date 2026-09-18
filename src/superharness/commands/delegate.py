@@ -219,7 +219,8 @@ def _build_reliable_task_execution_prompt(
     elif run_kind == "review":
         role = (
             "Review only: inspect the exact immutable review checkout and report a "
-            "structured LGTM or REJECTED verdict. Do not modify any file or task.\n"
+            "structured LGTM or REJECTED verdict. Do not modify repository files or "
+            "task state; returning the required final JSON object is mandatory.\n"
             f"The required review target SHA is {review_target_sha or 'missing'}.\n"
         )
     else:

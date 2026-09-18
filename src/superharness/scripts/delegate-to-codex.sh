@@ -74,6 +74,12 @@ if [[ $NON_INTERACTIVE -eq 1 ]]; then
     CODEX_ARGS+=("--sandbox" "workspace-write")
   fi
 
+  # Reliable Runs consume a structured artifact. Capture Codex's final message
+  # directly instead of relying on the model to perform an extra file write.
+  if [[ -n "${SUPERHARNESS_RUN_RESULT_PATH:-}" ]]; then
+    CODEX_ARGS+=("--output-last-message" "$SUPERHARNESS_RUN_RESULT_PATH")
+  fi
+
   exec codex "${CODEX_ARGS[@]}" "$PROMPT"
 else
   # Regular interactive session

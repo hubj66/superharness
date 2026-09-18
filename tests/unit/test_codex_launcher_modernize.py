@@ -8,6 +8,7 @@ the diagnostic-persistence contract for failed launches.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
@@ -45,9 +46,14 @@ def _fake_codex(tmp_path: Path, script_body: str = "#!/bin/bash\necho \"$@\"\n")
     return bin_dir
 
 
-def _invoke_launcher(tmp_path: Path, *args: str, env_extra: dict | None = None) -> subprocess.CompletedProcess:
+def _invoke_launcher(
+    tmp_path: Path,
+    *args: str,
+    env_extra: dict | None = None,
+    script_body: str = '#!/bin/bash\necho "$@"\n',
+) -> subprocess.CompletedProcess:
     """Run the Codex launcher against a fake ``codex`` binary."""
-    bin_dir = _fake_codex(tmp_path)
+    bin_dir = _fake_codex(tmp_path, script_body)
     project = tmp_path / "proj"
     project.mkdir()
     env = os.environ.copy()
@@ -61,6 +67,58 @@ def _invoke_launcher(tmp_path: Path, *args: str, env_extra: dict | None = None) 
         env=env,
         check=False,
     )
+
+
+@pytest.mark.regression
+@pytest.mark.parametrize(
+    ("verdict", "findings"),
+    [("LGTM", []), ("REJECTED", ["Ruff violations remain"])],
+)
+def test_codex_launcher_captures_structured_review_final_message(
+    tmp_path: Path, verdict: str, findings: list[str]
+) -> None:
+    """Reliable Codex reviews must not depend on a model-initiated file write."""
+    result_dir = tmp_path / "result dir"
+    result_dir.mkdir()
+    result_path = result_dir / "run-review.json"
+    payload = {
+        "schema_version": 1,
+        "run_id": "run-review",
+        "task_id": "gh-253",
+        "kind": "review",
+        "agent": "codex-cli",
+        "exit_code": 0,
+        "completion_status": "completed",
+        "review_verdict": verdict,
+        "reviewed_sha": "sha-a",
+        "findings": findings,
+    }
+    fake_codex = """#!/bin/bash
+set -euo pipefail
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--output-last-message" ]]; then
+    printf '%s' "$FAKE_CODEX_RESULT" > "$2"
+    exit 0
+  fi
+  shift
+done
+exit 9
+"""
+
+    result = _invoke_launcher(
+        tmp_path,
+        "--non-interactive",
+        "--model",
+        "gpt-5.5",
+        env_extra={
+            "SUPERHARNESS_RUN_RESULT_PATH": str(result_path),
+            "FAKE_CODEX_RESULT": json.dumps(payload),
+        },
+        script_body=fake_codex,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result_path.read_text(encoding="utf-8")) == payload
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +139,7 @@ def test_codex_launcher_uses_sandbox_workspace_write_for_non_interactive(
     # Modern replacement
     assert "--sandbox" in result.stdout
     assert "workspace-write" in result.stdout
+    assert "--output-last-message" not in result.stdout
     # Deprecated flag must NOT appear
     assert "--full-auto" not in result.stdout
 

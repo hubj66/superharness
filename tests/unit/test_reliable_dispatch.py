@@ -329,7 +329,14 @@ def test_linked_review_run_supplies_model_and_run_prompt(tmp_path):
         conn.close()
 
 
-def test_linked_review_run_ingests_structured_result_artifact(tmp_path):
+@pytest.mark.regression
+@pytest.mark.parametrize(
+    ("verdict", "findings"),
+    [("LGTM", []), ("REJECTED", ["Ruff violations remain"])],
+)
+def test_linked_review_run_ingests_structured_result_artifact(
+    tmp_path, verdict, findings
+):
     project, conn = _project(tmp_path)
     try:
         conn.execute("UPDATE tasks SET status='review_requested' WHERE id='t1'")
@@ -376,9 +383,9 @@ def test_linked_review_run_ingests_structured_result_artifact(tmp_path):
                     "agent": "codex-cli",
                     "exit_code": 0,
                     "completion_status": "completed",
-                    "review_verdict": "LGTM",
+                    "review_verdict": verdict,
                     "reviewed_sha": "sha-a",
-                    "findings": [],
+                    "findings": findings,
                 }
             ),
             encoding="utf-8",
@@ -388,8 +395,9 @@ def test_linked_review_run_ingests_structured_result_artifact(tmp_path):
         _reliable_run_finished(ctx)
         run = runs_dao.get_run(conn, "run-1")
         assert run is not None and run.status == "succeeded"
-        assert run.review_verdict == "LGTM"
+        assert run.review_verdict == verdict
         assert run.result_json["reviewed_sha"] == "sha-a"
+        assert run.result_json["findings"] == findings
     finally:
         conn.close()
 
@@ -435,7 +443,7 @@ def test_review_exit_zero_without_artifact_fails_run(tmp_path):
         assert run is not None
         assert run.status == "failed"
         assert run.failure_category == "invalid_result"
-        assert run.failure_detail == "structured Run result was missing or invalid"
+        assert "was not created" in (run.failure_detail or "")
     finally:
         conn.close()
 
@@ -497,6 +505,55 @@ def test_review_artifact_with_wrong_run_id_fails_run(tmp_path):
         assert run is not None
         assert run.status == "failed"
         assert run.failure_category == "invalid_result"
+    finally:
+        conn.close()
+
+
+def test_review_malformed_artifact_fails_closed_with_diagnostic(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        conn.execute("UPDATE tasks SET status='review_requested' WHERE id='t1'")
+        conn.execute(
+            """
+            UPDATE runs
+               SET kind='review',
+                   agent='codex-cli',
+                   review_target_sha='sha-a'
+             WHERE id='run-1'
+            """
+        )
+        conn.commit()
+        _sqlite_claim_next(str(project), "claude-code", NOW)
+        ctx = DispatchContext(
+            project_dir=str(project),
+            inbox_file=str(project / ".superharness" / "inbox.yaml"),
+            contract_file=str(project / ".superharness" / "contract.yaml"),
+            print_only=False,
+            non_interactive=True,
+            codex_bypass=False,
+            launcher_timeout=0,
+            script_dir=str(project),
+            sqlite_primary=True,
+            item_id="inbox-1",
+            item_task="t1",
+            item_to="codex-cli",
+            item_project=str(project),
+            exec_project=str(project),
+            run_id="run-1",
+            item={"plan_only": False},
+        )
+        _prepare_execution(ctx)
+        Path(ctx.spawn_env["SUPERHARNESS_RUN_RESULT_PATH"]).write_text(
+            "not-json", encoding="utf-8"
+        )
+        _reliable_run_started(ctx, pid=None)
+        ctx.launcher_rc = 0
+        _reliable_run_finished(ctx)
+
+        run = runs_dao.get_run(conn, "run-1")
+        assert run is not None and run.status == "failed"
+        assert run.failure_category == "invalid_result"
+        assert "malformed JSON" in (run.failure_detail or "")
     finally:
         conn.close()
 

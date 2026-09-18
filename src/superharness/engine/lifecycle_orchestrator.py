@@ -83,6 +83,7 @@ REVIEW_RETRY_CATEGORIES = frozenset(
     }
 )
 REVIEW_VALID_VERDICTS = REVIEW_VERDICTS
+REVIEW_RECOVERY_DEDUPE_PREFIX = "review-recovery:"
 
 
 def _now_utc() -> str:
@@ -164,6 +165,18 @@ class LifecycleOrchestrator:
                         runs_created=result.runs_created + recovered,
                         results_consumed=result.results_consumed,
                         transitions=result.transitions + recovery_transitions,
+                    )
+                    task = tasks_dao.get(conn, task.id)
+                    if task is None:
+                        continue
+                    review_recovered, review_recovery_transitions = (
+                        self._recover_stranded_review(conn, task)
+                    )
+                    result = TickResult(
+                        inspected=result.inspected,
+                        runs_created=result.runs_created + review_recovered,
+                        results_consumed=result.results_consumed,
+                        transitions=(result.transitions + review_recovery_transitions),
                     )
                     task = tasks_dao.get(conn, task.id)
                     if task is None:
@@ -563,6 +576,21 @@ class LifecycleOrchestrator:
                 )
                 return 0, 0
             if (
+                self._is_review_recovery(run)
+                and classification.category == "invalid_result"
+            ):
+                detail = (
+                    f"recovery review {run.id} failed with invalid_result at "
+                    f"{run.review_target_sha}; automatic review recovery is exhausted"
+                )
+                runs_dao.record_run_diagnostic(
+                    conn,
+                    run.id,
+                    failure_category="invalid_result",
+                    failure_detail=detail,
+                )
+                return 0, self._move_task(conn, task, "blocked", reason=detail)
+            if (
                 run.attempt < 2
                 and classification.category in REVIEW_RETRY_CATEGORIES
                 and self._agent_selectable(conn, run.agent)
@@ -608,6 +636,166 @@ class LifecycleOrchestrator:
                 return 0, 0
             return 0, self._move_task(conn, task, "blocked")
         return 0, 0
+
+    def _recover_stranded_review(
+        self, conn, task: tasks_dao.TaskRow
+    ) -> tuple[int, int]:
+        """Create one bounded review after two consumed invalid-result attempts."""
+        if task.status != "review_requested" or runs_dao.list_active_runs(
+            conn, task_id=task.id
+        ):
+            return 0, 0
+        reviews = runs_dao.list_runs_for_task(conn, task.id, kind="review")
+        normal_reviews = [run for run in reviews if not self._is_review_recovery(run)]
+        if not normal_reviews:
+            return 0, 0
+
+        metadata = self._pr_metadata(task)
+        target_sha = (
+            metadata["pr_head_sha"]
+            if metadata is not None
+            else normal_reviews[-1].review_target_sha
+        )
+        if not target_sha:
+            return 0, 0
+        source = self._exhausted_invalid_review_source(normal_reviews, target_sha)
+        if source is None:
+            return 0, 0
+        if metadata is None:
+            return self._block_review_recovery(
+                conn, task, source, "missing authoritative task PR metadata"
+            )
+        existing_recoveries = [
+            run
+            for run in reviews
+            if (self._is_review_recovery(run) and run.review_target_sha == target_sha)
+        ]
+        if existing_recoveries:
+            latest_recovery = existing_recoveries[-1]
+            if (
+                latest_recovery.orchestrator_consumed_at is not None
+                and latest_recovery.failure_category == "invalid_result"
+            ):
+                detail = (
+                    f"recovery review {latest_recovery.id} failed with "
+                    f"invalid_result at {target_sha}; automatic review recovery "
+                    "is exhausted"
+                )
+                runs_dao.record_run_diagnostic(
+                    conn,
+                    latest_recovery.id,
+                    failure_category="invalid_result",
+                    failure_detail=detail,
+                )
+                return 0, self._move_task(conn, task, "blocked", reason=detail)
+            return 0, 0
+        source_agent = metadata.get("source_agent")
+        if not isinstance(source_agent, str) or source_agent == CODEX_AGENT:
+            return self._block_review_recovery(
+                conn,
+                task,
+                source,
+                "independent producer identity is unavailable for Codex review",
+            )
+        if not self._is_git_repo():
+            return self._block_review_recovery(
+                conn, task, source, "project is not an available Git repository"
+            )
+        try:
+            worktree = create_review_worktree(
+                self.project_dir,
+                task.id,
+                branch_name=metadata["branch_name"],
+                review_target_sha=target_sha,
+            )
+        except StateError as exc:
+            return self._block_review_recovery(conn, task, source, str(exc))
+
+        assignment = self._select_reviewer(
+            conn,
+            task,
+            source_agent=source_agent,
+            preferred_agent=CODEX_AGENT,
+        )
+        if assignment is None or assignment.agent != CODEX_AGENT:
+            return self._block_review_recovery(
+                conn,
+                task,
+                source,
+                "independent Codex reviewer is not currently available",
+            )
+        dedupe_key = (
+            f"{REVIEW_RECOVERY_DEDUPE_PREFIX}{task.id}:{target_sha}:{source.id}"
+        )
+        self._create_dispatch_run(
+            conn,
+            task,
+            kind="review",
+            dedupe_key=dedupe_key,
+            agent=CODEX_AGENT,
+            model=DEFAULT_CODEX_MODEL,
+            attempt=source.attempt + 1,
+            parent_run_id=source.id,
+            trigger_run_id=source.id,
+            review_target_sha=target_sha,
+            prompt=self._review_prompt(task, metadata),
+            worktree_path=worktree.path,
+            branch_name=metadata["branch_name"],
+            base_sha=target_sha,
+            head_sha=target_sha,
+            pr_number=metadata["pr_number"],
+            pr_url=metadata["pr_url"],
+        )
+        return 1, 0
+
+    def _exhausted_invalid_review_source(
+        self, reviews: list[runs_dao.RunRow], target_sha: str
+    ) -> runs_dao.RunRow | None:
+        relevant = [run for run in reviews if run.review_target_sha == target_sha]
+        if not relevant or max(run.attempt for run in relevant) != 2:
+            return None
+        by_attempt: dict[int, runs_dao.RunRow] = {}
+        for run in relevant:
+            current = by_attempt.get(run.attempt)
+            if current is None or (run.created_at, run.id) > (
+                current.created_at,
+                current.id,
+            ):
+                by_attempt[run.attempt] = run
+        required = [by_attempt.get(attempt) for attempt in (1, 2)]
+        if any(run is None for run in required):
+            return None
+        attempts = cast(list[runs_dao.RunRow], required)
+        if not all(
+            run.orchestrator_consumed_at is not None
+            and run.status not in runs_dao.ACTIVE_RUN_STATUSES
+            and run.failure_category == "invalid_result"
+            for run in attempts
+        ):
+            return None
+        return attempts[-1]
+
+    def _block_review_recovery(
+        self,
+        conn,
+        task: tasks_dao.TaskRow,
+        source: runs_dao.RunRow,
+        reason: str,
+    ) -> tuple[int, int]:
+        detail = (
+            f"review recovery blocked after exhausted invalid_result attempts: {reason}"
+        )
+        runs_dao.record_run_diagnostic(
+            conn,
+            source.id,
+            failure_category="invalid_result",
+            failure_detail=detail,
+        )
+        return 0, self._move_task(conn, task, "blocked", reason=detail)
+
+    @staticmethod
+    def _is_review_recovery(run: runs_dao.RunRow) -> bool:
+        return run.dedupe_key.startswith(REVIEW_RECOVERY_DEDUPE_PREFIX)
 
     def _recover_stranded_failed_ship(
         self, conn, task: tasks_dao.TaskRow
@@ -1415,7 +1603,8 @@ class LifecycleOrchestrator:
                 f"Task: {task.id} - {task.title}",
                 f"PR: {metadata['pr_url']} (#{metadata['pr_number']})",
                 f"Review target SHA: {metadata['pr_head_sha']}",
-                "Write the structured Superharness execution result JSON to SUPERHARNESS_RUN_RESULT_PATH.",
+                "Follow the dispatcher-provided structured result contract exactly.",
+                "Do not put review prose outside the structured result findings.",
                 "The review_verdict must be LGTM or REJECTED.",
                 "The reviewed_sha must exactly equal the review target SHA.",
                 "If REJECTED, include concrete findings in the findings list.",

@@ -112,7 +112,7 @@ _MAPPING: dict[str, tuple[Optional[str], list[str], str]] = {
     ),
     "review_requested": (
         "review_passed",
-        ["review_passed", "review_failed"],
+        ["review_passed", "review_failed", "blocked"],
         "complete the review",
     ),
     "review_passed": (

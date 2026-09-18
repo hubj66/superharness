@@ -32,7 +32,7 @@ LEGAL_TRANSITIONS = {
     ],
     "pending_user_approval": ["in_progress", "stopped"],
     "report_ready": ["review_passed", "review_failed", "review_requested"],
-    "review_requested": ["review_passed", "review_failed"],
+    "review_requested": ["review_passed", "review_failed", "blocked"],
     "review_passed": ["done", "review_failed"],
     "review_failed": ["in_progress", "plan_proposed", "todo"],
     "done": [],

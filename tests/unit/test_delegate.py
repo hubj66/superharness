@@ -788,14 +788,16 @@ def test_reliable_review_prompt_is_read_only_and_sha_bound(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "Review only" in result.stdout
     assert "sha-review" in result.stdout
-    assert "Do not modify any file or task" in result.stdout
+    assert "Do not modify repository files or task state" in result.stdout
     assert "Structured result contract:" in result.stdout
-    assert "Write exactly one JSON object to" in result.stdout
+    assert "final response must be exactly one JSON object" in result.stdout
     assert "reviewed_sha" in result.stdout
     assert "review_verdict must be LGTM or REJECTED" in result.stdout
     assert "Set reviewed_sha exactly to sha-review" in result.stdout
     assert "findings" in result.stdout
     assert str(project / "artifact.json") in result.stdout
+    assert "Codex launcher writes that final response" in result.stdout
+    assert "Do not wrap the JSON in Markdown fences" in result.stdout
     assert "BLOCKED" not in result.stdout
 
 
