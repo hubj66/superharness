@@ -590,6 +590,19 @@ class LifecycleOrchestrator:
                     failure_detail=detail,
                 )
                 return 0, self._move_task(conn, task, "blocked", reason=detail)
+            if self._is_review_recovery(run):
+                # All other terminal failures for a recovery review must block:
+                # quota/session_limit leave agent availability as temporarily_blocked
+                # (already set by _record_agent_failure above); do not retry.
+                category = classification.category
+                detail = self._recovery_review_block_detail(run.id, category)
+                runs_dao.record_run_diagnostic(
+                    conn,
+                    run.id,
+                    failure_category=category,
+                    failure_detail=detail,
+                )
+                return 0, self._move_task(conn, task, "blocked", reason=detail)
             if (
                 run.attempt < 2
                 and classification.category in REVIEW_RETRY_CATEGORIES
@@ -672,19 +685,36 @@ class LifecycleOrchestrator:
         ]
         if existing_recoveries:
             latest_recovery = existing_recoveries[-1]
-            if (
-                latest_recovery.orchestrator_consumed_at is not None
-                and latest_recovery.failure_category == "invalid_result"
-            ):
-                detail = (
-                    f"recovery review {latest_recovery.id} failed with "
-                    f"invalid_result at {target_sha}; automatic review recovery "
-                    "is exhausted"
-                )
+            if latest_recovery.orchestrator_consumed_at is not None:
+                category = latest_recovery.failure_category or "unknown"
+                if category == "invalid_result":
+                    detail = (
+                        f"recovery review {latest_recovery.id} failed with "
+                        f"invalid_result at {target_sha}; automatic review recovery "
+                        "is exhausted"
+                    )
+                elif category in {"quota", "session_limit"}:
+                    detail = (
+                        f"recovery review {latest_recovery.id} failed: independent "
+                        f"reviewer unavailable due to Codex {category} at {target_sha}; "
+                        "manual operator action required"
+                    )
+                elif category == "auth":
+                    detail = (
+                        f"recovery review {latest_recovery.id} failed: independent "
+                        f"reviewer authentication failure at {target_sha}; "
+                        "manual operator action required"
+                    )
+                else:
+                    detail = (
+                        f"recovery review {latest_recovery.id} failed with "
+                        f"{category!r} at {target_sha}; "
+                        "automatic review recovery is exhausted"
+                    )
                 runs_dao.record_run_diagnostic(
                     conn,
                     latest_recovery.id,
-                    failure_category="invalid_result",
+                    failure_category=category,
                     failure_detail=detail,
                 )
                 return 0, self._move_task(conn, task, "blocked", reason=detail)
@@ -774,6 +804,23 @@ class LifecycleOrchestrator:
         ):
             return None
         return attempts[-1]
+
+    @staticmethod
+    def _recovery_review_block_detail(run_id: str, category: str) -> str:
+        if category in {"quota", "session_limit"}:
+            return (
+                f"recovery review {run_id} failed: independent reviewer unavailable "
+                f"due to Codex {category}; manual operator action required"
+            )
+        if category == "auth":
+            return (
+                f"recovery review {run_id} failed: independent reviewer "
+                "authentication failure; manual operator action required"
+            )
+        return (
+            f"recovery review {run_id} failed with {category!r}; "
+            "automatic review recovery is exhausted"
+        )
 
     def _block_review_recovery(
         self,

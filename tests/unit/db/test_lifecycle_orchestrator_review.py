@@ -10,8 +10,8 @@ from superharness.engine import agent_availability, inbox_dao, runs_dao, tasks_d
 from superharness.engine.db import get_connection, init_db
 from superharness.engine.lifecycle_orchestrator import LifecycleOrchestrator
 from superharness.engine.reliable_worktree import ManagedWorktree
-from superharness.engine.state_errors import StateError
 from superharness.engine.shipper import ShipOutcome
+from superharness.engine.state_errors import StateError
 
 NOW = "2026-01-01T00:00:00Z"
 LATER = "2026-01-01T02:00:00Z"
@@ -1071,5 +1071,321 @@ def test_exhausted_non_invalid_reviews_do_not_use_special_recovery(
         assert result.runs_created == 0
         assert tasks_dao.get(conn, "t1").status == "review_requested"
         assert len(runs_dao.list_runs_for_task(conn, "t1", kind="review")) == 2
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Recovery review quota/session_limit/auth edge cases
+# ---------------------------------------------------------------------------
+
+
+def _create_consumed_recovery(
+    conn,
+    *,
+    category: str,
+    status: str = "failed",
+    sha: str = "sha-a",
+) -> runs_dao.RunRow:
+    """Create a pre-consumed recovery run (attempt 3) for use in stranded tests."""
+    _first, second = _consumed_exhausted_reviews(conn, sha=sha)
+    dedupe_key = f"review-recovery:t1:{sha}:{second.id}"
+    recovery = runs_dao.create_run(
+        conn,
+        id="review-recovery-1",
+        task_id="t1",
+        kind="review",
+        agent="codex-cli",
+        model="gpt-5.5",
+        attempt=3,
+        dedupe_key=dedupe_key,
+        parent_run_id=second.id,
+        trigger_run_id=second.id,
+        review_target_sha=sha,
+        now=NOW,
+    )
+    runs_dao.transition_run(conn, recovery.id, to_status="claimed", now=NOW)
+    runs_dao.transition_run(conn, recovery.id, to_status="running", now=NOW)
+    runs_dao.transition_run(
+        conn,
+        recovery.id,
+        to_status=status,
+        now=NOW,
+        failure_category=category,
+        failure_detail=category,
+    )
+    runs_dao.mark_run_consumed(conn, recovery.id, now=NOW)
+    conn.commit()
+    return runs_dao.get_run(conn, recovery.id) or recovery
+
+
+def test_recovery_quota_blocks_task(tmp_path, monkeypatch):
+    """Recovery review attempt 3 with quota → task blocked, no attempt 4."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _consumed_exhausted_reviews(conn)
+        _allow_review_recovery(monkeypatch)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        recovery = max(
+            runs_dao.list_runs_for_task(conn, "t1", kind="review"),
+            key=lambda r: r.attempt,
+        )
+        assert recovery.attempt == 3
+
+        _fail_review(conn, recovery, category="quota", status="quota_blocked")
+        orch.tick("t1")
+
+        task = tasks_dao.get(conn, "t1")
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        assert task is not None and task.status == "blocked"
+        assert "independent reviewer unavailable due to Codex quota" in (
+            task.pause_reason or ""
+        )
+        assert len(reviews) == 3
+        availability = agent_availability.get(conn, "codex-cli")
+        assert availability is not None and availability.state == "temporarily_blocked"
+    finally:
+        conn.close()
+
+
+def test_recovery_session_limit_blocks_task(tmp_path, monkeypatch):
+    """Recovery review attempt 3 with session_limit → task blocked, no attempt 4."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _consumed_exhausted_reviews(conn)
+        _allow_review_recovery(monkeypatch)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        recovery = max(
+            runs_dao.list_runs_for_task(conn, "t1", kind="review"),
+            key=lambda r: r.attempt,
+        )
+
+        _fail_review(conn, recovery, category="session_limit")
+        orch.tick("t1")
+
+        task = tasks_dao.get(conn, "t1")
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        assert task is not None and task.status == "blocked"
+        assert "independent reviewer unavailable due to Codex session_limit" in (
+            task.pause_reason or ""
+        )
+        assert len(reviews) == 3
+        availability = agent_availability.get(conn, "codex-cli")
+        assert availability is not None and availability.state == "temporarily_blocked"
+    finally:
+        conn.close()
+
+
+def test_recovery_auth_blocks_task(tmp_path, monkeypatch):
+    """Recovery review attempt 3 with auth → task blocked, no attempt 4."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _consumed_exhausted_reviews(conn)
+        _allow_review_recovery(monkeypatch)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        recovery = max(
+            runs_dao.list_runs_for_task(conn, "t1", kind="review"),
+            key=lambda r: r.attempt,
+        )
+
+        _fail_review(conn, recovery, category="auth")
+        orch.tick("t1")
+
+        task = tasks_dao.get(conn, "t1")
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        assert task is not None and task.status == "blocked"
+        assert "independent reviewer authentication failure" in (task.pause_reason or "")
+        assert len(reviews) == 3
+    finally:
+        conn.close()
+
+
+def test_historical_consumed_recovery_quota_blocks_on_next_tick(tmp_path):
+    """Stranded task with consumed recovery (quota) → blocked on next tick."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _create_consumed_recovery(conn, category="quota", status="quota_blocked")
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+
+        orch.tick("t1")
+
+        task = tasks_dao.get(conn, "t1")
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        assert task is not None and task.status == "blocked"
+        assert "independent reviewer unavailable due to Codex quota" in (
+            task.pause_reason or ""
+        )
+        assert len(reviews) == 3
+    finally:
+        conn.close()
+
+
+def test_historical_consumed_recovery_session_limit_blocks_on_next_tick(tmp_path):
+    """Stranded task with consumed recovery (session_limit) → blocked on next tick."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _create_consumed_recovery(conn, category="session_limit")
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+
+        orch.tick("t1")
+
+        task = tasks_dao.get(conn, "t1")
+        assert task is not None and task.status == "blocked"
+        assert "independent reviewer unavailable due to Codex session_limit" in (
+            task.pause_reason or ""
+        )
+    finally:
+        conn.close()
+
+
+def test_historical_consumed_recovery_auth_blocks_on_next_tick(tmp_path):
+    """Stranded task with consumed recovery (auth) → blocked on next tick."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _create_consumed_recovery(conn, category="auth")
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+
+        orch.tick("t1")
+
+        task = tasks_dao.get(conn, "t1")
+        assert task is not None and task.status == "blocked"
+        assert "independent reviewer authentication failure" in (task.pause_reason or "")
+    finally:
+        conn.close()
+
+
+def test_repeated_ticks_remain_idempotently_blocked(tmp_path, monkeypatch):
+    """Once blocked, repeated ticks do not create new runs or change status."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _consumed_exhausted_reviews(conn)
+        _allow_review_recovery(monkeypatch)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        recovery = max(
+            runs_dao.list_runs_for_task(conn, "t1", kind="review"),
+            key=lambda r: r.attempt,
+        )
+        _fail_review(conn, recovery, category="quota", status="quota_blocked")
+        orch.tick("t1")
+
+        assert tasks_dao.get(conn, "t1").status == "blocked"
+
+        for _ in range(3):
+            result = orch.tick("t1")
+            assert result.runs_created == 0
+            assert result.transitions == 0
+
+        assert tasks_dao.get(conn, "t1").status == "blocked"
+        assert len(runs_dao.list_runs_for_task(conn, "t1", kind="review")) == 3
+    finally:
+        conn.close()
+
+
+def test_no_attempt_4_is_created_after_recovery_failure(tmp_path, monkeypatch):
+    """After recovery review fails with quota, no fourth review run is ever created."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a")
+        _consumed_exhausted_reviews(conn)
+        _allow_review_recovery(monkeypatch)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        recovery = max(
+            runs_dao.list_runs_for_task(conn, "t1", kind="review"),
+            key=lambda r: r.attempt,
+        )
+        assert recovery.attempt == 3
+
+        _fail_review(conn, recovery, category="quota", status="quota_blocked")
+        for _ in range(5):
+            orch.tick("t1")
+
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        assert len(reviews) == 3
+        assert all(r.attempt <= 3 for r in reviews)
+        assert tasks_dao.get(conn, "t1").status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_claude_never_selected_as_reviewer(tmp_path, monkeypatch):
+    """Claude (claude-code) is never selected as the recovery reviewer."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_requested", sha="sha-a", source_agent="claude-code")
+        _consumed_exhausted_reviews(conn)
+        _allow_review_recovery(monkeypatch)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        recovery_runs = [r for r in reviews if r.attempt == 3]
+        for run in recovery_runs:
+            assert run.agent != "claude-code", (
+                f"Claude was selected as recovery reviewer: {run.agent}"
+            )
+        if recovery_runs:
+            assert recovery_runs[0].agent == "codex-cli"
+    finally:
+        conn.close()
+
+
+def test_normal_attempt_1_retry_behavior_unchanged(tmp_path):
+    """Normal review attempt 1 with network failure → retries as attempt 2."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        review = runs_dao.list_runs_for_task(conn, "t1", kind="review")[0]
+        assert review.attempt == 1
+
+        _fail_review(conn, review, category="network")
+        orch.tick("t1")
+
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        assert len(reviews) == 2
+        retry = max(reviews, key=lambda r: r.attempt)
+        assert retry.attempt == 2
+        assert retry.trigger_run_id == review.id
+        assert tasks_dao.get(conn, "t1").status == "review_requested"
+    finally:
+        conn.close()
+
+
+def test_normal_attempt_2_does_not_create_attempt_3(tmp_path):
+    """Normal review attempt 2 failure does not create attempt 3 (only recovery does)."""
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        review1 = runs_dao.list_runs_for_task(conn, "t1", kind="review")[0]
+        _fail_review(conn, review1, category="network")
+        orch.tick("t1")
+        review2 = max(
+            runs_dao.list_runs_for_task(conn, "t1", kind="review"),
+            key=lambda r: r.attempt,
+        )
+        assert review2.attempt == 2
+
+        _fail_review(conn, review2, category="network")
+        orch.tick("t1")
+        orch.tick("t1")
+
+        reviews = runs_dao.list_runs_for_task(conn, "t1", kind="review")
+        assert len(reviews) == 2
+        assert all(r.attempt <= 2 for r in reviews)
+        assert tasks_dao.get(conn, "t1").status == "review_requested"
     finally:
         conn.close()
