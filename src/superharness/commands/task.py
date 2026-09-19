@@ -27,6 +27,12 @@ logger = logging.getLogger(__name__)
 
 VALID_OWNERS = frozenset(KNOWN_HARNESSES) | {"owner"}
 VALID_CREATE_STATUSES = {"todo", "in_progress", "pending_user_approval", "done"}
+
+# (from_status, to_status) pairs a human operator may apply to tasks they don't own.
+# Narrow by design — add new entries only when an explicit recovery workflow requires it.
+OPERATOR_RECOVERY_TRANSITIONS: frozenset[tuple[str, str]] = frozenset({
+    ("blocked", "pr_open"),
+})
 VALID_WORKFLOWS = {
     "implementation",
     "quick",
@@ -592,6 +598,7 @@ def status_update(
     reason: str = "",
     summary: str = "",
     _recursion_guard: bool = False,
+    operator: bool = False,
 ) -> int:
     _validate_token("task id", task_id)
 
@@ -629,18 +636,57 @@ def status_update(
         if not owner:
             _abort(f"task '{task_id}' has no owner set")
 
+        _op_audit_row_id: int | None = None
+
         if actor != owner and not _recursion_guard:
-            _abort(
-                f"forbidden: actor '{actor}' cannot update task '{task_id}' owned by '{owner}'"
-            )  # shipguard:ignore PY-007
+            if operator:
+                _current = str(task_row.status or "")
+                if (_current, status) not in OPERATOR_RECOVERY_TRANSITIONS:
+                    _allowed = ", ".join(
+                        f"'{f}' -> '{t}'" for f, t in sorted(OPERATOR_RECOVERY_TRANSITIONS)
+                    )
+                    _abort(
+                        f"operator override does not support '{_current}' -> '{status}' "
+                        f"for task '{task_id}'. Supported operator transitions: {_allowed}",
+                        2,
+                    )
+                # Valid operator-authorized recovery — write audit trail and proceed.
+                try:
+                    from superharness.engine import operator_commands_dao as _ocd
 
-        # Validate against the legal status transition graph
-        try:
-            from superharness.engine.next_action import validate_status_transition
+                    _op_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    _op_key = f"cli-operator-recover-{task_id}-{status}-{_op_now}"
+                    _op_row, _ = _ocd.insert(
+                        conn,
+                        idempotency_key=_op_key,
+                        command=f"operator-recover:{status}",
+                        task_id=task_id,
+                        sender_id=actor,
+                        now=_op_now,
+                    )
+                    _op_audit_row_id = _op_row.id
+                except Exception as _ex:
+                    logger.warning("operator audit insert failed: %s", _ex)
+            else:
+                _abort(
+                    f"forbidden: actor '{actor}' cannot update task '{task_id}' owned by '{owner}'"
+                )  # shipguard:ignore PY-007
 
-            validate_status_transition(str(task_row.status or ""), status)
-        except ValueError as _e:
-            _abort(f"status transition rejected: {_e}", 2)
+        # Validate against the legal status transition graph.
+        # Operator-authorized transitions in OPERATOR_RECOVERY_TRANSITIONS are
+        # intentionally excluded from the global graph; skip graph validation for
+        # them so the graph itself stays narrow.
+        _is_operator_recovery = (
+            operator
+            and (str(task_row.status or ""), status) in OPERATOR_RECOVERY_TRANSITIONS
+        )
+        if not _is_operator_recovery:
+            try:
+                from superharness.engine.next_action import validate_status_transition
+
+                validate_status_transition(str(task_row.status or ""), status)
+            except ValueError as _e:
+                _abort(f"status transition rejected: {_e}", 2)
 
         # Scope guard on plan_approved
         if status == "plan_approved":
@@ -682,6 +728,22 @@ def status_update(
             changes["stopped_at"] = None
 
         tasks_dao.update(conn, task_id, task_row.version, changes)
+
+        # Mark operator audit row as executed now that the transition is committed.
+        if _op_audit_row_id is not None:
+            try:
+                from superharness.engine import operator_commands_dao as _ocd2
+
+                _ocd2.update_status(
+                    conn,
+                    _op_audit_row_id,
+                    status="executed",
+                    result={"message": f"Task {task_id} recovered to {status} by operator {actor}"},
+                    now=now,
+                )
+            except Exception as _ex:
+                logger.warning("operator audit update_status failed: %s", _ex)
+
         conn.commit()
     finally:
         conn.close()
@@ -1165,6 +1227,17 @@ def main(argv: list[str] | None = None) -> None:
     p_status.add_argument("--reason", default="")
     p_status.add_argument("--summary", default="")
     p_status.add_argument(
+        "--operator",
+        action="store_true",
+        default=False,
+        help=(
+            "Assert explicit operator authorization for recovery transitions "
+            "(e.g. blocked -> pr_open). Actor need not be the task owner. "
+            "Writes an audit row. Allowed transitions: "
+            + ", ".join(f"'{f}' -> '{t}'" for f, t in sorted(OPERATOR_RECOVERY_TRANSITIONS))
+        ),
+    )
+    p_status.add_argument(
         "--json",
         action="store_true",
         default=False,
@@ -1451,6 +1524,7 @@ def main(argv: list[str] | None = None) -> None:
                     actor=opts.actor,
                     reason=opts.reason or "",
                     summary=opts.summary or "",
+                    operator=getattr(opts, "operator", False),
                 )
             finally:
                 sys.stdout = _orig_stdout
@@ -1475,6 +1549,7 @@ def main(argv: list[str] | None = None) -> None:
             actor=opts.actor,
             reason=opts.reason or "",
             summary=opts.summary or "",
+            operator=getattr(opts, "operator", False),
         )
         # Sync inbox after status update
         _sync_inbox_after_status(project_dir, opts.task_id, opts.status)
