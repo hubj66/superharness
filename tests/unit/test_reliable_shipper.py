@@ -396,6 +396,123 @@ def test_repair_worktree_resets_same_task_branch_to_current_remote_head(tmp_path
     assert _run(worktree, "rev-parse", "HEAD") == pr_head
 
 
+def test_repair_worktree_is_created_cleanly_at_remote_head(tmp_path):
+    project, worktree, branch, remote_head = _shipping_fixture(tmp_path)
+    _run(worktree, "push", "origin", f"{branch}:{branch}")
+    _run(project, "worktree", "remove", "--force", str(worktree))
+
+    repair = create_repair_worktree(
+        str(project), "t1", branch_name=branch, expected_head_sha=remote_head
+    )
+
+    repair_path = Path(repair.path)
+    assert repair_path == worktree
+    assert repair.branch_name == branch
+    assert repair.base_sha == remote_head
+    assert _run(repair_path, "branch", "--show-current") == branch
+    assert _run(repair_path, "rev-parse", "HEAD") == remote_head
+    assert _is_clean(str(repair_path))
+    assert (repair_path / ".superharness").resolve() == (
+        project / ".superharness"
+    ).resolve()
+
+
+def test_missing_registered_repair_worktree_is_recreated_at_remote_head(tmp_path):
+    project, worktree, branch, remote_head = _shipping_fixture(tmp_path)
+    _run(worktree, "push", "origin", f"{branch}:{branch}")
+    shutil.rmtree(worktree)
+    assert not worktree.exists()
+    assert str(worktree) in _run(project, "worktree", "list", "--porcelain")
+
+    repair = create_repair_worktree(
+        str(project), "t1", branch_name=branch, expected_head_sha=remote_head
+    )
+
+    repair_path = Path(repair.path)
+    assert repair_path == worktree
+    assert repair.branch_name == branch
+    assert repair.base_sha == remote_head
+    assert _run(repair_path, "branch", "--show-current") == branch
+    assert _run(repair_path, "rev-parse", "HEAD") == remote_head
+    assert _run(repair_path, "rev-parse", "--git-common-dir")
+    assert _is_clean(str(repair_path))
+    assert (repair_path / ".superharness").resolve() == (
+        project / ".superharness"
+    ).resolve()
+
+
+def test_repair_worktree_rejects_wrong_remote_head(tmp_path):
+    project, worktree, branch, _remote_head = _shipping_fixture(tmp_path)
+    _run(worktree, "push", "origin", f"{branch}:{branch}")
+
+    with pytest.raises(StateError, match="Remote origin/"):
+        create_repair_worktree(
+            str(project),
+            "t1",
+            branch_name=branch,
+            expected_head_sha="0" * 40,
+        )
+
+
+def test_dirty_repair_worktree_requires_explicit_reset_permission(tmp_path):
+    project, worktree, branch, remote_head = _shipping_fixture(tmp_path)
+    _run(worktree, "push", "origin", f"{branch}:{branch}")
+    (worktree / "README.md").write_text("dirty repair\n", encoding="utf-8")
+
+    with pytest.raises(StateError, match="has uncommitted changes"):
+        create_repair_worktree(
+            str(project), "t1", branch_name=branch, expected_head_sha=remote_head
+        )
+    assert (worktree / "README.md").read_text(encoding="utf-8") == "dirty repair\n"
+
+    repair = create_repair_worktree(
+        str(project),
+        "t1",
+        branch_name=branch,
+        expected_head_sha=remote_head,
+        allow_dirty_reset=True,
+    )
+
+    assert repair.path == str(worktree)
+    assert _run(worktree, "rev-parse", "HEAD") == remote_head
+    assert (worktree / "README.md").read_text(encoding="utf-8") == "base\n"
+
+
+def test_repair_worktree_rejects_unrelated_repository_at_managed_path(tmp_path):
+    project, worktree, branch, remote_head = _shipping_fixture(tmp_path)
+    _run(worktree, "push", "origin", f"{branch}:{branch}")
+    _run(project, "worktree", "remove", "--force", str(worktree))
+    subprocess.run(["git", "init", "-b", branch, str(worktree)], check=True)
+    _run(worktree, "config", "user.name", "Unrelated")
+    _run(worktree, "config", "user.email", "unrelated@example.test")
+    (worktree / "marker.txt").write_text("do not modify\n", encoding="utf-8")
+    _run(worktree, "add", "marker.txt")
+    _run(worktree, "commit", "-m", "unrelated")
+
+    with pytest.raises(StateError, match="is not from this repository"):
+        create_repair_worktree(
+            str(project), "t1", branch_name=branch, expected_head_sha=remote_head
+        )
+
+    assert (worktree / "marker.txt").read_text(encoding="utf-8") == "do not modify\n"
+
+
+def test_repair_worktree_does_not_steal_branch_from_healthy_worktree(tmp_path):
+    project, worktree, branch, remote_head = _shipping_fixture(tmp_path)
+    _run(worktree, "push", "origin", f"{branch}:{branch}")
+    healthy_path = tmp_path / "healthy-worktree"
+    _run(project, "worktree", "move", str(worktree), str(healthy_path))
+
+    with pytest.raises(StateError, match="already used by worktree"):
+        create_repair_worktree(
+            str(project), "t1", branch_name=branch, expected_head_sha=remote_head
+        )
+
+    assert not worktree.exists()
+    assert _run(healthy_path, "branch", "--show-current") == branch
+    assert _run(healthy_path, "rev-parse", "HEAD") == remote_head
+
+
 def test_recovery_worktree_preserves_uncommitted_changes_at_remote_head(tmp_path):
     project, worktree, branch, base_sha = _shipping_fixture(tmp_path)
     _run(worktree, "push", "origin", f"{branch}:{branch}")

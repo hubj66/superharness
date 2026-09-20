@@ -208,24 +208,36 @@ def create_repair_worktree(
     os.makedirs(root, exist_ok=True)
 
     if os.path.isdir(path):
-        current_branch = current_branch_name(path)
-        if current_branch != branch_name:
-            raise StateError(
-                f"Managed worktree {path!r} is on {current_branch!r}, not {branch_name!r}"
-            )
+        _verify_repair_worktree_identity(project_dir, path, branch_name)
         if not _is_clean(path) and not allow_dirty_reset:
             raise StateError(f"Repair worktree {path!r} has uncommitted changes")
         _run_git(path, "reset", "--hard", remote_sha)
+        _verify_repair_worktree_head(path, remote_sha)
         _link_superharness_state(project_dir, path)
         return ManagedWorktree(path=path, branch_name=branch_name, base_sha=remote_sha)
 
-    if ref_exists(project_dir, f"refs/heads/{branch_name}"):
-        _run_git(project_dir, "branch", "--force", branch_name, remote_sha)
-    else:
+    if not ref_exists(project_dir, f"refs/heads/{branch_name}"):
         _run_git(project_dir, "branch", branch_name, remote_sha)
     result = _run_git(project_dir, "worktree", "add", path, branch_name, check=False)
+    if result.returncode != 0 and _can_force_readd_missing_worktree(
+        project_dir, path, result.stderr
+    ):
+        result = _run_git(
+            project_dir,
+            "worktree",
+            "add",
+            "-f",
+            path,
+            branch_name,
+            check=False,
+        )
     if result.returncode != 0:
         raise StateError(result.stderr.strip() or "git repair worktree add failed")
+    _verify_repair_worktree_identity(project_dir, path, branch_name)
+    _run_git(path, "reset", "--hard", remote_sha)
+    _verify_repair_worktree_head(path, remote_sha)
+    if not _is_clean(path):
+        raise StateError(f"New repair worktree {path!r} is not clean")
     _link_superharness_state(project_dir, path)
     return ManagedWorktree(path=path, branch_name=branch_name, base_sha=remote_sha)
 
@@ -294,6 +306,52 @@ def _worktree_name(task_id: str) -> str:
 def _is_missing_registered_worktree_error(stderr: str) -> bool:
     text = stderr.lower()
     return "missing but already registered worktree" in text
+
+
+def _can_force_readd_missing_worktree(project_dir: str, path: str, stderr: str) -> bool:
+    """Allow Git's forced re-add only for this exact missing, prunable path."""
+    if not _is_missing_registered_worktree_error(stderr) or os.path.lexists(path):
+        return False
+    result = _run_git(project_dir, "worktree", "list", "--porcelain", "-z", check=False)
+    if result.returncode != 0:
+        return False
+    expected = os.path.realpath(path)
+    for record in result.stdout.split("\0\0"):
+        fields = record.split("\0")
+        registered = next(
+            (
+                field.removeprefix("worktree ")
+                for field in fields
+                if field.startswith("worktree ")
+            ),
+            None,
+        )
+        if registered is None or os.path.realpath(registered) != expected:
+            continue
+        return any(field.startswith("prunable ") for field in fields)
+    return False
+
+
+def _verify_repair_worktree_identity(
+    project_dir: str, path: str, branch_name: str
+) -> None:
+    if not is_managed_worktree_path(project_dir, path):
+        raise StateError(f"Repair worktree {path!r} is outside managed roots")
+    if _git_common_dir(project_dir) != _git_common_dir(path):
+        raise StateError(f"Repair worktree {path!r} is not from this repository")
+    current_branch = current_branch_name(path)
+    if current_branch != branch_name:
+        raise StateError(
+            f"Managed worktree {path!r} is on {current_branch!r}, not {branch_name!r}"
+        )
+
+
+def _verify_repair_worktree_head(path: str, expected_head_sha: str) -> None:
+    head = rev_parse(path, "HEAD")
+    if head != expected_head_sha:
+        raise StateError(
+            f"Repair worktree {path!r} is at {head}, not {expected_head_sha}"
+        )
 
 
 def verify_review_worktree(path: str, review_target_sha: str) -> None:
