@@ -956,9 +956,6 @@ def _auto_peer_approve_plans(project_dir: str) -> int:
 
 
 _PR_URL_RE = __import__("re").compile(r"https://github\.com/[^/]+/[^/]+/pull/\d+")
-_GITHUB_PR_URL_RE = __import__("re").compile(
-    r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)/?$"
-)
 
 
 def _find_pr_url_in_handoff(handoff_dir: str, task_id: str) -> str | None:
@@ -1072,187 +1069,14 @@ def _trigger_auto_review(project_dir: str, task_id: str, reviewers: list[str]) -
     return True
 
 
-def _authoritative_reliable_lgtm_review(conn, task):
-    """Return the consumed reliable LGTM review Run that authorizes close."""
-    import json
-
-    from superharness.engine import runs_dao
-    from superharness.engine.run_results import validate_result_for_run
-
-    if not _is_reliable_task(task):
-        return None
-    if str(getattr(task, "status", "")) != "review_passed":
-        return None
-    try:
-        extras = json.loads(getattr(task, "extras_json", None) or "{}")
-    except (TypeError, json.JSONDecodeError):
-        return None
-    if not isinstance(extras, dict):
-        return None
-    metadata = extras.get("reliable_orchestrator")
-    if not isinstance(metadata, dict):
-        return None
-
-    review_run_id = metadata.get("last_review_run_id")
-    reviewed_sha = metadata.get("last_reviewed_head_sha")
-    pr_head_sha = metadata.get("pr_head_sha")
-    if (
-        not isinstance(review_run_id, str)
-        or not review_run_id
-        or metadata.get("last_review_verdict") != "LGTM"
-        or not isinstance(reviewed_sha, str)
-        or not reviewed_sha
-        or not isinstance(pr_head_sha, str)
-        or reviewed_sha != pr_head_sha
-    ):
-        return None
-
-    run = runs_dao.get_run(conn, review_run_id)
-    if run is None:
-        return None
-    if (
-        run.task_id != getattr(task, "id", None)
-        or run.kind != "review"
-        or run.status != "succeeded"
-        or run.finished_at is None
-        or run.orchestrator_consumed_at is None
-        or run.review_verdict != "LGTM"
-        or run.review_target_sha != reviewed_sha
-    ):
-        return None
-
-    try:
-        result = validate_result_for_run(run.result_json, run)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    if (
-        result.completion_status != "completed"
-        or result.review_verdict != "LGTM"
-        or result.reviewed_sha != reviewed_sha
-    ):
-        return None
-    return run
-
-
-def _parse_github_pr_url(pr_url: str) -> tuple[str, str, int] | None:
-    match = _GITHUB_PR_URL_RE.match(pr_url.strip())
-    if not match:
-        return None
-    owner, repo, number = match.groups()
-    return owner, repo, int(number)
-
-
-def _fetch_github_pr(project_dir: str, pr_url: str) -> dict | None:
-    import json
-    import shutil
-    import subprocess
-
-    parsed = _parse_github_pr_url(pr_url)
-    if parsed is None or shutil.which("gh") is None:
-        return None
-    owner, repo, number = parsed
-    try:
-        result = subprocess.run(
-            ["gh", "api", f"repos/{owner}/{repo}/pulls/{number}"],
-            cwd=project_dir,
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError:
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
-def _recorded_pr_was_merged_at_sha(
-    project_dir: str, metadata: dict, expected_sha: str
-) -> bool:
-    pr_url = metadata.get("pr_url")
-    pr_number = metadata.get("pr_number")
-    if not isinstance(pr_url, str) or not isinstance(pr_number, int):
-        return False
-    parsed = _parse_github_pr_url(pr_url)
-    if parsed is None:
-        return False
-    _owner, _repo, url_number = parsed
-    if url_number != pr_number:
-        return False
-
-    payload = _fetch_github_pr(project_dir, pr_url)
-    if payload is None:
-        return False
-    if payload.get("number") != pr_number:
-        return False
-    html_url = payload.get("html_url")
-    if not isinstance(html_url, str) or html_url.rstrip("/") != pr_url.rstrip("/"):
-        return False
-    if payload.get("merged") is not True:
-        return False
-    head = payload.get("head")
-    if not isinstance(head, dict):
-        return False
-    return head.get("sha") == expected_sha
-
-
-def _auto_close_reliable_review_passed(project_dir: str, close_task) -> int:
-    """Finalize reliable tasks only after the orchestrator persisted valid LGTM."""
-    import json
-
-    from superharness.engine import tasks_dao
-    from superharness.engine.db import get_connection, init_db
-
-    closed = 0
-    conn = get_connection(project_dir)
-    try:
-        init_db(conn)
-        for task in tasks_dao.get_all(conn, status="review_passed"):
-            run = _authoritative_reliable_lgtm_review(conn, task)
-            if run is None:
-                continue
-            try:
-                extras = json.loads(task.extras_json or "{}")
-            except (TypeError, json.JSONDecodeError):
-                continue
-            metadata = extras.get("reliable_orchestrator")
-            if not isinstance(metadata, dict) or not _recorded_pr_was_merged_at_sha(
-                project_dir, metadata, run.review_target_sha
-            ):
-                continue
-            actor = task.owner or "owner"
-            rc = close_task(
-                project_dir=project_dir,
-                task_id=task.id,
-                actor=actor,
-                summary=(
-                    "Reliable orchestrator review passed: consumed LGTM "
-                    f"from {run.agent} for {run.review_target_sha}."
-                ),
-                skip_verify=True,
-            )
-            if rc == 0:
-                closed += 1
-    finally:
-        conn.close()
-    return closed
-
-
 def _auto_close_review_passed(project_dir: str) -> None:
-    """Auto-close review_requested tasks when a reviewer submits a verdict report.
-
-    Scans inbox for items with status==done and outcome containing "LGTM" or "REJECTED".
-    """
+    """Auto-close review tasks when a reviewer submits a verdict report."""
     import re as _re
-
     import yaml as _yaml
-
     from superharness.commands.close import close_task
+    from superharness.engine.reliable_review_autoclose import (
+        auto_close_reliable_review_passed,
+    )
 
     profile_file = os.path.join(project_dir, ".superharness", "profile.yaml")
     profile: dict = {}
@@ -1260,23 +1084,15 @@ def _auto_close_review_passed(project_dir: str) -> None:
         try:
             with open(profile_file, encoding="utf-8") as _f:
                 profile = _yaml.safe_load(_f.read()) or {}
-        except Exception as e:
+        except (OSError, _yaml.YAMLError) as e:
             logger.warning("inbox_watch unexpected error: %s", e, exc_info=True)
             return
 
-    # Same opt-in rule as _auto_close_report_ready
     auto_close = profile.get("auto_close", _profile_autonomy(profile) == "ai_driven")
     if not auto_close:
         return
 
-    try:
-        _auto_close_reliable_review_passed(project_dir, close_task)
-    except Exception as e:
-        logger.warning(
-            "_auto_close_reliable_review_passed: unexpected error: %s",
-            e,
-            exc_info=True,
-        )
+    auto_close_reliable_review_passed(project_dir, close_task)
 
     tasks = _load_tasks(project_dir)
     if not tasks:
@@ -1439,7 +1255,7 @@ def _auto_close_report_ready(project_dir: str) -> None:
         try:
             with open(profile_file, encoding="utf-8") as _f:
                 profile = _yaml.safe_load(_f.read()) or {}
-        except Exception as e:
+        except (OSError, _yaml.YAMLError) as e:
             logger.warning("inbox_watch unexpected error: %s", e, exc_info=True)
             return
 

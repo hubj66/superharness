@@ -219,7 +219,7 @@ def test_reliable_review_passed_with_authoritative_lgtm_but_open_pr_does_not_clo
         _create_review_run(conn)
         _set_reliable_review_metadata(conn)
         monkeypatch.setattr(
-            "superharness.commands.inbox_watch._fetch_github_pr",
+            "superharness.engine.reliable_review_autoclose.fetch_github_pr",
             lambda _project_dir, _pr_url: _pr_payload(merged=False),
         )
 
@@ -243,7 +243,7 @@ def test_reliable_review_passed_with_authoritative_lgtm_and_merged_pr_closes_onc
         _create_review_run(conn)
         _set_reliable_review_metadata(conn)
         monkeypatch.setattr(
-            "superharness.commands.inbox_watch._fetch_github_pr",
+            "superharness.engine.reliable_review_autoclose.fetch_github_pr",
             lambda _project_dir, _pr_url: _pr_payload(),
         )
 
@@ -299,7 +299,7 @@ def test_reliable_review_passed_merged_pr_wrong_or_unprovable_head_does_not_clos
             _create_review_run(conn)
             _set_reliable_review_metadata(conn)
             monkeypatch.setattr(
-                "superharness.commands.inbox_watch._fetch_github_pr",
+                "superharness.engine.reliable_review_autoclose.fetch_github_pr",
                 lambda _project_dir, _pr_url, payload=payload: payload,
             )
 
@@ -326,7 +326,7 @@ def test_reliable_review_passed_github_lookup_error_does_not_close(
         _create_review_run(conn)
         _set_reliable_review_metadata(conn)
         monkeypatch.setattr(
-            "superharness.commands.inbox_watch._fetch_github_pr",
+            "superharness.engine.reliable_review_autoclose.fetch_github_pr",
             lambda _project_dir, _pr_url: None,
         )
 
@@ -363,7 +363,7 @@ def test_reliable_review_passed_rejected_failed_or_malformed_review_does_not_clo
             )
             _set_reliable_review_metadata(conn, verdict=verdict)
             monkeypatch.setattr(
-                "superharness.commands.inbox_watch._fetch_github_pr",
+                "superharness.engine.reliable_review_autoclose.fetch_github_pr",
                 lambda _project_dir, _pr_url: _pr_payload(),
             )
 
