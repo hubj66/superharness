@@ -142,6 +142,13 @@ class LifecycleOrchestrator:
                 for task in tasks:
                     if task is None or not is_reliable_orchestrated_task(task):
                         continue
+                    previously_consumed_review_ids = {
+                        run.id
+                        for run in runs_dao.list_runs_for_task(
+                            conn, task.id, kind="review"
+                        )
+                        if run.orchestrator_consumed_at is not None
+                    }
                     result = TickResult(
                         inspected=result.inspected + 1,
                         runs_created=result.runs_created,
@@ -171,7 +178,11 @@ class LifecycleOrchestrator:
                     if task is None:
                         continue
                     review_recovered, review_recovery_transitions = (
-                        self._recover_stranded_review(conn, task)
+                        self._recover_stranded_review(
+                            conn,
+                            task,
+                            previously_consumed_review_ids=previously_consumed_review_ids,
+                        )
                     )
                     result = TickResult(
                         inspected=result.inspected,
@@ -667,9 +678,19 @@ class LifecycleOrchestrator:
         return 0, 0
 
     def _recover_stranded_review(
-        self, conn, task: tasks_dao.TaskRow
+        self,
+        conn,
+        task: tasks_dao.TaskRow,
+        *,
+        previously_consumed_review_ids: set[str],
     ) -> tuple[int, int]:
-        """Create one bounded review after two consumed invalid-result attempts."""
+        """Recover bounded review failures without replaying result consumption."""
+        if task.status == "review_failed":
+            return self._recover_stranded_rejected_review(
+                conn,
+                task,
+                previously_consumed_review_ids=previously_consumed_review_ids,
+            )
         if task.status != "review_requested" or runs_dao.list_active_runs(
             conn, task_id=task.id
         ):
@@ -797,6 +818,49 @@ class LifecycleOrchestrator:
             pr_url=metadata["pr_url"],
         )
         return 1, 0
+
+    def _recover_stranded_rejected_review(
+        self,
+        conn,
+        task: tasks_dao.TaskRow,
+        *,
+        previously_consumed_review_ids: set[str],
+    ) -> tuple[int, int]:
+        """Ensure the missing repair for one previously consumed rejection."""
+        if runs_dao.list_active_runs(conn, task_id=task.id):
+            return 0, 0
+        reviews = runs_dao.list_runs_for_task(conn, task.id, kind="review")
+        if not reviews:
+            return 0, 0
+        rejected = reviews[-1]
+        if (
+            rejected.id not in previously_consumed_review_ids
+            or rejected.status != "succeeded"
+            or rejected.orchestrator_consumed_at is None
+            or rejected.review_verdict != "REJECTED"
+            or rejected.failure_category not in {None, "repair_blocked"}
+        ):
+            return 0, 0
+        if any(
+            run.trigger_run_id == rejected.id
+            for run in runs_dao.list_runs_for_task(conn, task.id, kind="repair")
+        ):
+            return 0, 0
+        try:
+            result = validate_result_for_run(rejected.result_json, rejected)
+        except (BoundaryError, ValueError, TypeError, json.JSONDecodeError):
+            return 0, 0
+        if (
+            result.completion_status != "completed"
+            or result.review_verdict != "REJECTED"
+            or result.reviewed_sha != rejected.review_target_sha
+        ):
+            return 0, 0
+        created = self._ensure_repair_run(conn, task, rejected, result)
+        if not created:
+            return 0, 0
+        self._transition_task(conn, task, "in_progress")
+        return 1, 1
 
     def _exhausted_invalid_review_source(
         self, reviews: list[runs_dao.RunRow], target_sha: str

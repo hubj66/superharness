@@ -116,6 +116,48 @@ def _complete_review(
     conn.commit()
 
 
+def _stranded_review(
+    conn,
+    *,
+    verdict: str = "REJECTED",
+    consumed: bool = True,
+    status: str = "succeeded",
+    valid: bool = True,
+) -> runs_dao.RunRow:
+    review = runs_dao.create_run(
+        conn,
+        id="review-stranded",
+        task_id="t1",
+        kind="review",
+        agent="codex-cli",
+        model="gpt-5.5",
+        dedupe_key="review:t1:sha-a:stranded",
+        review_target_sha="sha-a",
+        now=NOW,
+    )
+    if status == "succeeded":
+        _complete_review(
+            conn,
+            review,
+            verdict=verdict,
+            sha="sha-a",
+            findings=["ruff format failed"],
+        )
+        if not valid:
+            conn.execute(
+                "UPDATE runs SET result_json=? WHERE id=?",
+                (json.dumps({"not": "a valid run result"}), review.id),
+            )
+    else:
+        _fail_review(conn, review, category="invalid_result", status=status)
+    if consumed:
+        runs_dao.mark_run_consumed(conn, review.id, now=NOW)
+    conn.commit()
+    resolved = runs_dao.get_run(conn, review.id)
+    assert resolved is not None
+    return resolved
+
+
 def _fail_review(
     conn,
     run: runs_dao.RunRow,
@@ -607,6 +649,175 @@ def test_rejected_current_sha_creates_exactly_one_claude_repair(tmp_path):
         assert repairs[0].base_sha == "sha-a"
         assert "checkout ignores coupons" in repairs[0].result_json["prompt"]
         assert "Reviewed SHA: sha-a" in repairs[0].result_json["prompt"]
+    finally:
+        conn.close()
+
+
+def test_stranded_consumed_rejection_recovers_one_claude_repair(tmp_path, monkeypatch):
+    project, conn = _project(tmp_path)
+    blocked = {"value": True}
+
+    def repair_worktree(project_dir, task_id, branch_name, expected_head_sha):
+        if blocked["value"]:
+            raise StateError("missing but already registered worktree")
+        return ManagedWorktree(
+            "/tmp/superharness-worktrees/reliable/t1",
+            branch_name,
+            expected_head_sha,
+        )
+
+    try:
+        _task(conn)
+        orch = LifecycleOrchestrator(str(project), now=lambda: NOW)
+        orch.tick("t1")
+        review = runs_dao.list_runs_for_task(conn, "t1", kind="review")[0]
+        _complete_review(
+            conn,
+            review,
+            verdict="REJECTED",
+            sha="sha-a",
+            findings=["ruff format failed"],
+        )
+        monkeypatch.setattr(LifecycleOrchestrator, "_is_git_repo", lambda self: True)
+        monkeypatch.setattr(
+            "superharness.engine.lifecycle_orchestrator.create_repair_worktree",
+            repair_worktree,
+        )
+
+        first = orch.tick("t1")
+        consumed = runs_dao.get_run(conn, review.id)
+        assert first.runs_created == 0
+        assert consumed is not None and consumed.orchestrator_consumed_at is not None
+        assert consumed.failure_category == "repair_blocked"
+        assert tasks_dao.get(conn, "t1").status == "review_failed"
+
+        blocked["value"] = False
+        recovered = orch.tick("t1")
+        repairs = runs_dao.list_runs_for_task(conn, "t1", kind="repair")
+        repair_inbox = [
+            row for row in inbox_dao.get_all(conn) if row.run_id == repairs[0].id
+        ]
+        assert recovered.runs_created == 1
+        assert recovered.transitions == 1
+        assert tasks_dao.get(conn, "t1").status == "in_progress"
+        assert len(repairs) == 1
+        assert repairs[0].agent == "claude-code"
+        assert repairs[0].trigger_run_id == review.id
+        assert repairs[0].base_sha == "sha-a"
+        assert "ruff format failed" in repairs[0].result_json["prompt"]
+        assert len(repair_inbox) == 1
+
+        repeated = orch.tick("t1")
+        assert repeated.runs_created == 0
+        assert len(runs_dao.list_runs_for_task(conn, "t1", kind="repair")) == 1
+    finally:
+        conn.close()
+
+
+def test_stranded_rejection_with_existing_repair_does_not_duplicate(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_failed")
+        review = _stranded_review(conn)
+        repair = runs_dao.create_run(
+            conn,
+            id="repair-existing",
+            task_id="t1",
+            kind="repair",
+            agent="claude-code",
+            dedupe_key=f"repair:t1:{review.id}",
+            trigger_run_id=review.id,
+            now=NOW,
+        )
+        _fail_review(conn, repair, category="unknown")
+        runs_dao.mark_run_consumed(conn, repair.id, now=NOW)
+        conn.commit()
+
+        result = LifecycleOrchestrator(str(project), now=lambda: LATER).tick("t1")
+
+        assert result.runs_created == 0
+        assert tasks_dao.get(conn, "t1").status == "review_failed"
+        assert len(runs_dao.list_runs_for_task(conn, "t1", kind="repair")) == 1
+    finally:
+        conn.close()
+
+
+def test_stranded_rejection_remains_review_failed_when_repair_is_still_blocked(
+    tmp_path, monkeypatch
+):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_failed")
+        review = _stranded_review(conn)
+        monkeypatch.setattr(LifecycleOrchestrator, "_is_git_repo", lambda self: True)
+        monkeypatch.setattr(
+            "superharness.engine.lifecycle_orchestrator.create_repair_worktree",
+            lambda *args, **kwargs: (_ for _ in ()).throw(StateError("still stale")),
+        )
+
+        result = LifecycleOrchestrator(str(project), now=lambda: LATER).tick("t1")
+        blocked_review = runs_dao.get_run(conn, review.id)
+
+        assert result.runs_created == 0
+        assert tasks_dao.get(conn, "t1").status == "review_failed"
+        assert not runs_dao.list_runs_for_task(conn, "t1", kind="repair")
+        assert blocked_review is not None
+        assert blocked_review.failure_category == "repair_blocked"
+        assert "confirmed PR head" in blocked_review.failure_detail
+    finally:
+        conn.close()
+
+
+def test_stranded_rejection_at_stale_pr_head_does_not_create_repair(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_failed", sha="sha-b")
+        review = _stranded_review(conn)
+
+        result = LifecycleOrchestrator(str(project), now=lambda: LATER).tick("t1")
+        stale_review = runs_dao.get_run(conn, review.id)
+
+        assert result.runs_created == 0
+        assert tasks_dao.get(conn, "t1").status == "review_failed"
+        assert not runs_dao.list_runs_for_task(conn, "t1", kind="repair")
+        assert stale_review is not None
+        assert stale_review.failure_category == "stale_review"
+    finally:
+        conn.close()
+
+
+def test_stranded_lgtm_is_not_a_repair_candidate(tmp_path):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_failed")
+        _stranded_review(conn, verdict="LGTM")
+
+        result = LifecycleOrchestrator(str(project), now=lambda: LATER).tick("t1")
+
+        assert result.runs_created == 0
+        assert tasks_dao.get(conn, "t1").status == "review_failed"
+        assert not runs_dao.list_runs_for_task(conn, "t1", kind="repair")
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("case", ["failed", "invalid", "unconsumed"])
+def test_ineligible_review_is_not_used_for_stranded_repair_recovery(tmp_path, case):
+    project, conn = _project(tmp_path)
+    try:
+        _task(conn, status="review_failed")
+        if case == "failed":
+            _stranded_review(conn, status="failed")
+        elif case == "invalid":
+            _stranded_review(conn, valid=False)
+        else:
+            _stranded_review(conn, consumed=False)
+
+        result = LifecycleOrchestrator(str(project), now=lambda: LATER).tick("t1")
+
+        assert result.runs_created == 0
+        assert tasks_dao.get(conn, "t1").status == "review_failed"
+        assert not runs_dao.list_runs_for_task(conn, "t1", kind="repair")
     finally:
         conn.close()
 
